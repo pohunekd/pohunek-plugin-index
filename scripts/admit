@@ -154,8 +154,12 @@ check() {
   tag_sha="$(tag_commit "$source_repo" "$source_tag")" ||
     fail "2 tag" "refs/tags/$source_tag does not resolve"
   [ "$tag_sha" = "$source_commit" ] || fail "2 tag commit" "tag commit differs from commit"
-  claim="$(gh api "repos/$source_repo/contents/.pohunek-plugin/index-claim?ref=$source_commit" \
-    --jq .content | base64 -d; printf x)"
+  gh api "repos/$source_repo/contents/.pohunek-plugin/index-claim?ref=$source_commit" \
+    --jq .content >"$WORK/claim.b64" 2>/dev/null ||
+    fail "2 index-claim" ".pohunek-plugin/index-claim is missing at the commit"
+  base64 -d <"$WORK/claim.b64" >"$WORK/claim" 2>/dev/null ||
+    fail "2 index-claim" "index-claim is not readable"
+  claim="$(cat -- "$WORK/claim"; printf x)"
   [ "$claim" = "$package_id"$'\n'x ] || fail "2 index-claim" "index-claim is not '$package_id'"
   pass "2 repo control"
 
@@ -222,10 +226,15 @@ rebuild() {
   [ "$(git -C "$core_dir" rev-parse HEAD)" = "$built_sha" ] ||
     fail "5 checkout" "core checkout is not the built_with commit"
 
-  rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' "$core_dir/rust-toolchain.toml")" --profile minimal
-  (cd "$core_dir" && cargo build --locked -p xtask)
+  [ -d "$plugin_dir/package" ] ||
+    fail "5 package-dir" "the plugin keeps its package in the 'package' directory, the default of plugin-release.yml"
+  rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' "$core_dir/rust-toolchain.toml")" --profile minimal ||
+    fail "5 rebuild" "the core toolchain could not be installed"
+  (cd "$core_dir" && cargo build --locked -p xtask) ||
+    fail "5 rebuild" "xtask at the built_with tag does not build"
   mkdir -p "$WORK/rebuilt"
-  line="$(cd "$core_dir" && ./target/debug/xtask plugin build --dir "$plugin_dir/package" --output-dir "$WORK/rebuilt")"
+  line="$(cd "$core_dir" && ./target/debug/xtask plugin build --dir "$plugin_dir/package" --output-dir "$WORK/rebuilt")" ||
+    fail "5 rebuild" "xtask plugin build refused the package"
   read -r _ _ _ built_id built_version built_digest _ <<<"$line"
   [ "$built_id" = "$package_id" ] && [ "$built_version" = "$version" ] && [ "$built_digest" = "$digest" ] ||
     fail "5 rebuild" "rebuilt $built_id $built_version $built_digest differs from the entry"
@@ -233,11 +242,28 @@ rebuild() {
 
 # The reviewer approves the launched program, args, launch_env, [integration]
 # and requires, not only the green checks.
+# Extracts runtime.toml and the detection manifest it names into `$2` from the
+# archive `$1`. The manifest path comes from the archive, so it is limited to a
+# relative path of safe characters. Returns 1 when either file is unavailable.
+unpack_views() {
+  local archive_file="$1" dir="$2" manifest
+  mkdir -p "$dir"
+  zstd -dc -- "$archive_file" | tar -x -C "$dir" runtime.toml || return 1
+  manifest="$(sed -n 's/^detect_manifest = "\(.*\)"$/\1/p' "$dir/runtime.toml" | head -n 1)"
+  case "$manifest" in
+    "" | /* | *..* | *[!A-Za-z0-9._/-]*) return 1 ;;
+  esac
+  zstd -dc -- "$archive_file" | tar -x -O -f - "$manifest" >"$dir/detect.toml" || return 1
+}
+
+# The reviewer approves the launched program, args, launch_env, [integration]
+# and requires, not only the green checks.
 reviewer_view() {
   local unpack="$WORK/unpacked" previous prev_dir
   rm -rf -- "$unpack"
-  mkdir -p "$unpack"
-  zstd -dc -- "$archive" | tar -x -C "$unpack" runtime.toml detect.toml
+  if ! unpack_views "$archive" "$unpack"; then
+    fail "reviewer view" "runtime.toml or the detection manifest it names cannot be read from the archive"
+  fi
   for file in runtime.toml detect.toml; do
     emit_file "$file" "$unpack/$file"
   done
@@ -250,18 +276,23 @@ reviewer_view() {
     local prev_url prev_digest
     prev_url="$(sed -n 's/^url = "\(.*\)"$/\1/p' "$previous")"
     prev_digest="$(sed -n 's/^digest = "\(.*\)"$/\1/p' "$previous")"
-    download_capped "$prev_url" "$prev_dir/archive.tar.zst" &&
-      [ "sha256:$(sha256 "$prev_dir/archive.tar.zst")" = "$prev_digest" ] &&
-      zstd -dc -- "$prev_dir/archive.tar.zst" | tar -x -C "$prev_dir" runtime.toml detect.toml || {
+    download_capped "$prev_url" "$WORK/previous.tar.zst" &&
+      [ "sha256:$(sha256 "$WORK/previous.tar.zst")" = "$prev_digest" ] &&
+      unpack_views "$WORK/previous.tar.zst" "$prev_dir" || {
       printf '\nThe previous admitted archive could not be fetched and re-verified.\n' >>"$SUMMARY"
       return 0
     }
+    local diff_file="$WORK/views.diff" longest fence
+    : >"$diff_file"
+    for file in runtime.toml detect.toml; do
+      diff -u -- "$prev_dir/$file" "$unpack/$file" >>"$diff_file" || true
+    done
+    longest="$({ grep -o '`*' -- "$diff_file" || true; } | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
+    fence="$(printf '`%.0s' $(seq 1 "$((longest > 2 ? longest + 1 : 3))"))"
     {
-      printf '\n### diff -u against the previous admitted version\n\n```diff\n'
-      for file in runtime.toml detect.toml; do
-        diff -u -- "$prev_dir/$file" "$unpack/$file" || true
-      done
-      printf '```\n'
+      printf '\n### diff -u against the previous admitted version\n\n%sdiff\n' "$fence"
+      cat -- "$diff_file"
+      printf '%s\n' "$fence"
     } >>"$SUMMARY"
   fi
 }
@@ -269,6 +300,7 @@ reviewer_view() {
 prove() {
   local platform="$2"
   load_entry "$1"
+  printf '## Proof: `%s` on `%s`\n\n| Predicate | Result |\n|---|---|\n' "$1" "$platform" >>"$SUMMARY"
   case " $PROVEN_PLATFORMS " in
     *" $platform "*) ;;
     *) fail "6 platform" "platform '$platform' cannot be proven" ;;
@@ -283,16 +315,19 @@ prove() {
     fail "6 digest" "archive sha256 differs from digest"
 
   local core_sha daemon="pohunek-daemon-$core_version-$platform.tar.gz"
-  core_sha="$(tag_commit "$CORE_REPO" "$core_tag")"
+  core_sha="$(tag_commit "$CORE_REPO" "$core_tag")" ||
+    fail "6 core tag" "refs/tags/$core_tag does not resolve in $CORE_REPO"
   mkdir -p "$WORK/release"
-  gh release download "$core_tag" --repo "$CORE_REPO" --pattern "$daemon" --dir "$WORK/release"
+  gh release download "$core_tag" --repo "$CORE_REPO" --pattern "$daemon" --dir "$WORK/release" ||
+    fail "6 core archive" "$daemon cannot be downloaded from the $core_tag release"
   gh attestation verify "$WORK/release/$daemon" --repo "$CORE_REPO" \
     --signer-workflow "$CORE_EVIDENCE_WORKFLOW" \
     --signer-digest "$core_sha" \
     --source-ref "refs/tags/$core_tag" \
     --source-digest "$core_sha" \
     --deny-self-hosted-runners || fail "6 core attestation" "the core daemon archive is not attested"
-  tar -xzf "$WORK/release/$daemon" -C "$WORK/release"
+  tar -xzf "$WORK/release/$daemon" -C "$WORK/release" ||
+    fail "6 core archive" "$daemon cannot be extracted"
 
   xtask plugin prove --archive "$archive" --entry "$WORK/added/$entry" \
     --release-dir "$WORK/release/pohunek-daemon-$core_version-$platform" \

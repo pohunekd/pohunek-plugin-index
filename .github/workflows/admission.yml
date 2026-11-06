@@ -32,7 +32,7 @@ jobs:
         run: |
           set -euo pipefail
           entry_pattern='^official/[A-Za-z0-9._-]+/[A-Za-z0-9._+-]+\.toml$'
-          git diff --raw -z -M "$BASE_SHA"...HEAD >"$RUNNER_TEMP/changes.raw"
+          git diff --raw -z --no-renames "$BASE_SHA"...HEAD >"$RUNNER_TEMP/changes.raw"
           added=()
           deleted=()
           material=false
