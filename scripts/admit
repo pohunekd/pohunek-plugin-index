@@ -155,8 +155,8 @@ check() {
     fail "2 tag" "refs/tags/$source_tag does not resolve"
   [ "$tag_sha" = "$source_commit" ] || fail "2 tag commit" "tag commit differs from commit"
   gh api "repos/$source_repo/contents/.pohunek-plugin/index-claim?ref=$source_commit" \
-    --jq .content >"$WORK/claim.b64" 2>/dev/null ||
-    fail "2 index-claim" ".pohunek-plugin/index-claim is missing at the commit"
+    --jq .content >"$WORK/claim.b64" 2>"$WORK/claim.err" ||
+    fail "2 index-claim" ".pohunek-plugin/index-claim could not be read at the commit: $(head -c 300 "$WORK/claim.err")"
   base64 -d <"$WORK/claim.b64" >"$WORK/claim" 2>/dev/null ||
     fail "2 index-claim" "index-claim is not readable"
   claim="$(cat -- "$WORK/claim"; printf x)"
@@ -251,9 +251,9 @@ unpack_views() {
   zstd -dc -- "$archive_file" | tar -x -C "$dir" runtime.toml || return 1
   manifest="$(sed -n 's/^detect_manifest = "\(.*\)"$/\1/p' "$dir/runtime.toml" | head -n 1)"
   case "$manifest" in
-    "" | /* | *..* | *[!A-Za-z0-9._/-]*) return 1 ;;
+    "" | -* | /* | *..* | *[!A-Za-z0-9._/-]*) return 1 ;;
   esac
-  zstd -dc -- "$archive_file" | tar -x -O -f - "$manifest" >"$dir/detect.toml" || return 1
+  zstd -dc -- "$archive_file" | tar -x -O -f - -- "$manifest" >"$dir/detect.toml" || return 1
 }
 
 # The reviewer approves the launched program, args, launch_env, [integration]
@@ -299,8 +299,8 @@ reviewer_view() {
 
 prove() {
   local platform="$2"
-  load_entry "$1"
   printf '## Proof: `%s` on `%s`\n\n| Predicate | Result |\n|---|---|\n' "$1" "$platform" >>"$SUMMARY"
+  load_entry "$1"
   case " $PROVEN_PLATFORMS " in
     *" $platform "*) ;;
     *) fail "6 platform" "platform '$platform' cannot be proven" ;;
