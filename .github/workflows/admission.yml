@@ -1,0 +1,263 @@
+# Admission of plugin index entries. The `verdict` job is the required check.
+#
+# The workflow reads a pull request and never writes: read-only token, no
+# secrets, no environment, no cache and no privileged trigger.
+# Values from the pull request reach a shell only through `env:`.
+name: admission
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      entries: ${{ steps.plan.outputs.entries }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      material: ${{ steps.plan.outputs.material }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify the changed paths
+        id: plan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          entry_pattern='^official/[A-Za-z0-9._-]+/[A-Za-z0-9._+-]+\.toml$'
+          git diff --raw -z --no-renames "$BASE_SHA"...HEAD >"$RUNNER_TEMP/changes.raw"
+          added=()
+          deleted=()
+          material=false
+          failed=0
+          while IFS= read -r -d '' meta; do
+            IFS=' ' read -r _ new_mode _ _ status <<<"${meta#:}"
+            IFS= read -r -d '' path
+            second=""
+            case "$status" in
+              R* | C*) IFS= read -r -d '' second ;;
+            esac
+            case "$status" in
+              A)
+                if [[ "$path" == official/* ]]; then
+                  if [[ "$path" =~ $entry_pattern && "$new_mode" == 100644 ]]; then
+                    added+=("$path")
+                  elif [ "$path" != "official/.gitkeep" ]; then
+                    printf 'not a regular entry file: %q (mode %s)\n' "$path" "$new_mode" >&2
+                    failed=1
+                  fi
+                fi
+                ;;
+              D)
+                if [[ "$path" == official/* ]]; then
+                  deleted+=("$path")
+                fi
+                ;;
+              *)
+                if [[ "$path" == official/* || "$second" == official/* ]]; then
+                  printf 'an admitted entry may not be modified or renamed: %s %q %q\n' "$status" "$path" "$second" >&2
+                  failed=1
+                fi
+                ;;
+            esac
+            if [[ "$path" == keys/* || "$path" == revocations/* || "$second" == keys/* || "$second" == revocations/* ]]; then
+              material=true
+            fi
+          done <"$RUNNER_TEMP/changes.raw"
+          if [ "${#deleted[@]}" -gt 0 ]; then
+            {
+              printf '## De-admitted entries\n\n'
+              printf -- '- `%s`\n' "${deleted[@]}"
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi
+          test "$failed" = 0
+          entries="$(printf '%s\n' "${added[@]}" | jq -R . | jq -sc 'map(select(length > 0))')"
+          matrix="$(jq -c '[.[] as $e | ({platform: "x86_64-unknown-linux-gnu", runner: "ubuntu-24.04"}, {platform: "aarch64-apple-darwin", runner: "macos-14"}) + {entry: $e}]' <<<"$entries")"
+          {
+            printf 'entries=%s\n' "$entries"
+            printf 'matrix=%s\n' "$matrix"
+            printf 'material=%s\n' "$material"
+          } >>"$GITHUB_OUTPUT"
+
+  material:
+    name: material
+    needs: plan
+    if: needs.plan.outputs.material == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read the core tag
+        id: core
+        run: |
+          set -euo pipefail
+          tag="$(cat CORE_TAG)"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          printf 'tag=%s\n' "$tag" >>"$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: zajca/pohunek
+          ref: refs/tags/${{ steps.core.outputs.tag }}
+          path: core
+          persist-credentials: false
+      - name: Build xtask at the core tag
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' core/rust-toolchain.toml)" --profile minimal
+          (cd core && cargo build --locked -p xtask)
+      - name: Verify the key material
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          root="$PWD"
+          args=(index verify --record "$root/keys/official.record.json" --revocations "$root/revocations/revocations.json"
+            --anchor "$root/core/packaging/runtime-catalog-anchor.json" --channel "$root/core/packaging/plugin-index-channel.json")
+          # A successor list must rise in sequence, so the previous list is passed
+          # only when this pull request changes the revocation file.
+          if git cat-file -e "$BASE_SHA:revocations/revocations.json" 2>/dev/null &&
+            ! git diff --quiet "$BASE_SHA" HEAD -- revocations/revocations.json; then
+            git show "$BASE_SHA:revocations/revocations.json" >"$RUNNER_TEMP/previous-revocations.json"
+            args+=(--previous-revocations "$RUNNER_TEMP/previous-revocations.json")
+          fi
+          out="$(cd core && ./target/debug/xtask "${args[@]}")"
+          printf '%s\n' "$out"
+          [[ "$out" == "material verify ok: "* ]]
+
+  check:
+    name: check
+    needs: plan
+    if: needs.plan.outputs.entries != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: ${{ fromJSON(needs.plan.outputs.entries) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read the core tag
+        id: core
+        run: |
+          set -euo pipefail
+          tag="$(cat CORE_TAG)"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          printf 'tag=%s\n' "$tag" >>"$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: zajca/pohunek
+          ref: refs/tags/${{ steps.core.outputs.tag }}
+          path: core
+          persist-credentials: false
+      - name: Build xtask at the core tag
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' core/rust-toolchain.toml)" --profile minimal
+          (cd core && cargo build --locked -p xtask)
+      - name: Admit the entry (steps 1-5 and 7)
+        env:
+          ENTRY: ${{ matrix.entry }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export CORE_DIR="$PWD/core" BASE_REF="$BASE_SHA" WORK="$RUNNER_TEMP/admit" SUMMARY="$GITHUB_STEP_SUMMARY"
+          mkdir -p "$WORK"
+          scripts/admit check "$ENTRY"
+
+  prove:
+    name: prove
+    needs: [plan, check]
+    if: needs.plan.outputs.entries != '[]'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read the core tag
+        id: core
+        run: |
+          set -euo pipefail
+          tag="$(cat CORE_TAG)"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          printf 'tag=%s\n' "$tag" >>"$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: zajca/pohunek
+          ref: refs/tags/${{ steps.core.outputs.tag }}
+          path: core
+          persist-credentials: false
+      - name: Build xtask at the core tag
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' core/rust-toolchain.toml)" --profile minimal
+          (cd core && cargo build --locked -p xtask)
+      - name: Prove the entry on the platform (step 6)
+        env:
+          ENTRY: ${{ matrix.entry }}
+          PLATFORM: ${{ matrix.platform }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export CORE_DIR="$PWD/core" BASE_REF="$BASE_SHA" WORK="$RUNNER_TEMP/admit" SUMMARY="$GITHUB_STEP_SUMMARY"
+          mkdir -p "$WORK"
+          scripts/admit prove "$ENTRY" "$PLATFORM"
+      - name: Name the evidence file
+        if: always()
+        id: evidence
+        env:
+          ENTRY: ${{ matrix.entry }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          name="${ENTRY//\//_}-$PLATFORM"
+          printf 'name=%s\n' "$name" >>"$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: evidence-${{ steps.evidence.outputs.name }}
+          path: ${{ runner.temp }}/admit/evidence-*.json
+          if-no-files-found: ignore
+
+  verdict:
+    name: verdict
+    needs: [plan, material, check, prove]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every needed job
+        env:
+          PLAN: ${{ needs.plan.result }}
+          MATERIAL: ${{ needs.material.result }}
+          CHECK: ${{ needs.check.result }}
+          PROVE: ${{ needs.prove.result }}
+        run: |
+          set -euo pipefail
+          test "$PLAN" = success
+          for result in "$MATERIAL" "$CHECK" "$PROVE"; do
+            case "$result" in
+              success | skipped) ;;
+              *) printf 'a needed job ended %s\n' "$result" >&2; exit 1 ;;
+            esac
+          done
