@@ -123,7 +123,10 @@ jobs:
           root="$PWD"
           args=(index verify --record "$root/keys/official.record.json" --revocations "$root/revocations/revocations.json"
             --anchor "$root/core/packaging/runtime-catalog-anchor.json" --channel "$root/core/packaging/plugin-index-channel.json")
-          if git cat-file -e "$BASE_SHA:revocations/revocations.json" 2>/dev/null; then
+          # A successor list must rise in sequence, so the previous list is passed
+          # only when this pull request changes the revocation file.
+          if git cat-file -e "$BASE_SHA:revocations/revocations.json" 2>/dev/null &&
+            ! git diff --quiet "$BASE_SHA" HEAD -- revocations/revocations.json; then
             git show "$BASE_SHA:revocations/revocations.json" >"$RUNNER_TEMP/previous-revocations.json"
             args+=(--previous-revocations "$RUNNER_TEMP/previous-revocations.json")
           fi
