@@ -251,6 +251,10 @@ prove() {
     *" $platform "*) ;;
     *) fail "6 platform" "platform '$platform' cannot be proven" ;;
   esac
+  case ",$platforms," in
+    *",$platform,"*) ;;
+    *) printf '| 6 prove (%s) | skipped: platform not listed |\n' "$platform" >>"$SUMMARY"; return 0 ;;
+  esac
   archive="$WORK/$package_id-$version.tar.zst"
   download_capped "$url" "$archive" || fail "6 download" "download failed or exceeded the cap"
   [ "sha256:$(sha256sum -- "$archive" | cut -d' ' -f1)" = "$digest" ] ||

@@ -1,7 +1,7 @@
 # Admission of plugin index entries. The `verdict` job is the required check.
 #
 # The workflow reads a pull request and never writes: read-only token, no
-# secrets, no environment, no cache, no pull_request_target and no workflow_run.
+# secrets, no environment, no cache and no privileged trigger.
 # Values from the pull request reach a shell only through `env:`.
 name: admission
 
