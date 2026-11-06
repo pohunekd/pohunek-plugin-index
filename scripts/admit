@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# Admission predicates for ONE added index entry.
+#
+#   scripts/admit check <entry-file>            steps 1-5 and 7 (ubuntu)
+#   scripts/admit prove <entry-file> <platform> step 6 (one runner per platform)
+#
+# Every input arrives through the environment (set by admission.yml from `env:`):
+#   XTASK      xtask binary built at CORE_TAG (the only binary built before step 5)
+#   BASE_REF   git ref of the admitted tree (origin/main)
+#   WORK       empty scratch directory
+#   GH_TOKEN   read-only token for `gh api`, `gh release` and `gh attestation`
+#   SUMMARY    file that receives the reviewer view (GITHUB_STEP_SUMMARY)
+# Nothing from the pull request reaches a shell except through values printed by
+# `xtask index build --print-source` and `xtask index check-entry`, which are
+# validated first, and every expansion below is quoted.
+set -euo pipefail
+
+: "${XTASK:?XTASK is required}"
+: "${BASE_REF:?BASE_REF is required}"
+: "${WORK:?WORK is required}"
+: "${SUMMARY:?SUMMARY is required}"
+: "${GH_TOKEN:?GH_TOKEN is required}"
+
+# Largest plugin archive admitted.
+readonly MAX_ARCHIVE_BYTES=$((8 * 1024 * 1024))
+# Platforms an official entry may list, each proven on the runner named by admission.yml.
+readonly PROVEN_PLATFORMS="x86_64-unknown-linux-gnu aarch64-apple-darwin"
+readonly CORE_REPO="zajca/pohunek"
+readonly PLUGIN_RELEASE_WORKFLOW="zajca/pohunek/.github/workflows/plugin-release.yml"
+readonly CORE_EVIDENCE_WORKFLOW="zajca/pohunek/.github/workflows/release-evidence.yml"
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+core_tag="$(cat "$root/CORE_TAG")"
+core_version="${core_tag#v}"
+
+pass() { printf '| %s | pass |\n' "$1" >>"$SUMMARY"; }
+fail() {
+  printf '| %s | **fail** |\n\n```\n%s\n```\n' "$1" "$2" >>"$SUMMARY"
+  printf 'admission: %s failed: %s\n' "$1" "$2" >&2
+  exit 1
+}
+
+# Resolves a tag of `repo` through its qualified ref only. A bare sha or name
+# never resolves, and a commit of the fork network is not reachable as
+# `refs/tags/<tag>` of the parent.
+tag_commit() {
+  gh api "repos/$1/commits/refs/tags/$2" --jq .sha
+}
+
+# Fails unless `$1` names a published, non-draft, non-prerelease release.
+require_published_release() {
+  local state
+  state="$(gh release view "$2" --repo "$1" --json isDraft,isPrerelease \
+    --jq '(.isDraft | not) and (.isPrerelease | not)')"
+  [ "$state" = "true" ]
+}
+
+# Downloads `$1` to `$2`, at most MAX_ARCHIVE_BYTES, https only.
+download_capped() {
+  curl --proto '=https' --tlsv1.2 --max-redirs 5 --fail --silent --show-error --location \
+    --max-filesize "$MAX_ARCHIVE_BYTES" "$1" |
+    head -c "$((MAX_ARCHIVE_BYTES + 1))" >"$2" || true
+  local size
+  size="$(wc -c <"$2")"
+  [ "$size" -gt 0 ] && [ "$size" -le "$MAX_ARCHIVE_BYTES" ]
+}
+
+# Loads the validated fields of the entry into shell variables.
+load_entry() {
+  entry="$1"
+  case "$entry" in
+    official/*/*.toml) ;;
+    *) fail "layout" "not an entry path: $entry" ;;
+  esac
+  rm -rf -- "$WORK/added" "$WORK/existing"
+  mkdir -p "$WORK/added/official" "$WORK/existing"
+  cp --parents -- "$entry" "$WORK/added/"
+  git -C "$root" archive "$BASE_REF" official | tar -x -C "$WORK/existing"
+
+  local line key value
+  source_repo="" source_repo_id="" source_tag="" source_commit="" source_built_with=""
+  while IFS='=' read -r key value; do
+    case "$key" in
+      repo) source_repo="$value" ;;
+      repo_id) source_repo_id="$value" ;;
+      tag) source_tag="$value" ;;
+      commit) source_commit="$value" ;;
+      built_with) source_built_with="$value" ;;
+      *) fail "schema" "unexpected [source] key" ;;
+    esac
+  done < <("$XTASK" index build --entries "$WORK/added" --print-source)
+
+  while IFS='=' read -r key value; do
+    case "$key" in
+      package_id) package_id="$value" ;;
+      runtime_id) runtime_id="$value" ;;
+      version) version="$value" ;;
+      digest) digest="$value" ;;
+      url) url="$value" ;;
+      platforms) platforms="$value" ;;
+      *) fail "schema" "unexpected entry key" ;;
+    esac
+  done < <("$XTASK" index check-entry --entries "$WORK/added" --existing "$WORK/existing" \
+    --core-version "$core_version" --stage schema)
+}
+
+check() {
+  {
+    printf '## Admission: `%s`\n\n| Predicate | Result |\n|---|---|\n' "$1"
+  } >>"$SUMMARY"
+
+  # Step 1: schema, identity and version order (typed [source] included).
+  load_entry "$1" || fail "1 schema" "xtask index check-entry or build --print-source refused the entry"
+  pass "1 schema"
+
+  # Step 2: repository control, through qualified refs only.
+  [ "$(gh api "repos/$source_repo" --jq .id)" = "$source_repo_id" ] ||
+    fail "2 repo_id" "repository id differs from repo_id"
+  local tag_sha claim
+  tag_sha="$(tag_commit "$source_repo" "$source_tag")" ||
+    fail "2 tag" "refs/tags/$source_tag does not resolve"
+  [ "$tag_sha" = "$source_commit" ] || fail "2 tag commit" "tag commit differs from commit"
+  claim="$(gh api "repos/$source_repo/contents/.pohunek-plugin/index-claim?ref=$source_commit" \
+    --jq .content | base64 -d; printf x)"
+  [ "$claim" = "$package_id"$'\n'x ] || fail "2 index-claim" "index-claim is not '$package_id'"
+  pass "2 repo control"
+
+  # Step 3: archive.
+  [ "$url" = "https://github.com/$source_repo/releases/download/$source_tag/$package_id-$version.tar.zst" ] ||
+    fail "3 url" "url is not the release asset of the tag"
+  archive="$WORK/$package_id-$version.tar.zst"
+  download_capped "$url" "$archive" || fail "3 download" "download failed or exceeded the cap"
+  [ "sha256:$(sha256sum -- "$archive" | cut -d' ' -f1)" = "$digest" ] ||
+    fail "3 digest" "archive sha256 differs from digest"
+  pass "3 archive"
+
+  # Step 4: attestation by the core release workflow, identity pinned to the
+  # commit of the built_with tag of zajca/pohunek itself.
+  local built_sha
+  built_sha="$(tag_commit "$CORE_REPO" "$source_built_with")" ||
+    fail "4 built_with" "refs/tags/$source_built_with does not resolve in $CORE_REPO"
+  require_published_release "$CORE_REPO" "$source_built_with" ||
+    fail "4 built_with release" "$source_built_with is a draft, a pre-release or missing"
+  gh attestation verify "$archive" --repo "$source_repo" \
+    --signer-workflow "$PLUGIN_RELEASE_WORKFLOW" \
+    --signer-digest "$built_sha" \
+    --source-ref "refs/tags/$source_tag" \
+    --source-digest "$source_commit" \
+    --deny-self-hosted-runners >"$WORK/attestation.log" 2>&1 ||
+    fail "4 attestation" "$(cat "$WORK/attestation.log")"
+  pass "4 attestation"
+
+  # Step 5: rebuild. First step that compiles code other than CORE_TAG.
+  rebuild "$built_sha"
+  pass "5 rebuild"
+
+  # Step 7: core range (pure; checked before the expensive proofs).
+  "$XTASK" index check-entry --entries "$WORK/added" --existing "$WORK/existing" \
+    --core-version "$core_version" --stage core-range >"$WORK/core-range.log" 2>&1 ||
+    fail "7 core range" "$(cat "$WORK/core-range.log")"
+  pass "7 core range"
+
+  # Platforms are proven, never attested only.
+  local platform
+  IFS=',' read -r -a listed <<<"$platforms"
+  for platform in "${listed[@]}"; do
+    case " $PROVEN_PLATFORMS " in
+      *" $platform "*) ;;
+      *) fail "6 platform" "platform '$platform' cannot be proven" ;;
+    esac
+  done
+  pass "6 platforms provable"
+
+  reviewer_view
+}
+
+rebuild() {
+  local built_sha="$1" plugin_dir="$WORK/plugin" core_dir="$WORK/core" line
+  rm -rf -- "$plugin_dir" "$core_dir"
+  git init -q "$plugin_dir"
+  git -C "$plugin_dir" fetch -q --depth 1 "https://github.com/$source_repo" "$source_commit"
+  git -C "$plugin_dir" checkout -q --detach FETCH_HEAD
+  [ "$(git -C "$plugin_dir" rev-parse HEAD)" = "$source_commit" ] ||
+    fail "5 checkout" "plugin checkout is not the commit"
+  git init -q "$core_dir"
+  git -C "$core_dir" fetch -q --depth 1 "https://github.com/$CORE_REPO" "refs/tags/$source_built_with"
+  git -C "$core_dir" checkout -q --detach FETCH_HEAD
+  [ "$(git -C "$core_dir" rev-parse HEAD)" = "$built_sha" ] ||
+    fail "5 checkout" "core checkout is not the built_with commit"
+
+  rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' "$core_dir/rust-toolchain.toml")" --profile minimal
+  (cd "$core_dir" && cargo build --locked -p xtask)
+  mkdir -p "$WORK/rebuilt"
+  line="$("$core_dir/target/debug/xtask" plugin build --dir "$plugin_dir/package" --output-dir "$WORK/rebuilt")"
+  read -r _ _ _ built_id built_version built_digest _ <<<"$line"
+  [ "$built_id" = "$package_id" ] && [ "$built_version" = "$version" ] && [ "$built_digest" = "$digest" ] ||
+    fail "5 rebuild" "rebuilt $built_id $built_version $built_digest differs from the entry"
+}
+
+# The reviewer approves the launched program, args, launch_env, [integration]
+# and requires, not only the green checks.
+reviewer_view() {
+  local unpack="$WORK/unpacked" previous prev_dir
+  rm -rf -- "$unpack"
+  mkdir -p "$unpack"
+  zstd -dc -- "$archive" | tar -x -C "$unpack" runtime.toml detect.toml
+  for file in runtime.toml detect.toml; do
+    {
+      printf '\n### %s\n\n```toml\n' "$file"
+      cat -- "$unpack/$file"
+      printf '```\n'
+    } >>"$SUMMARY"
+  done
+
+  previous="$(find "$WORK/existing/official/$package_id" -name '*.toml' 2>/dev/null | sort -V | tail -n 1 || true)"
+  if [ -n "$previous" ]; then
+    prev_dir="$WORK/previous"
+    rm -rf -- "$prev_dir"
+    mkdir -p "$prev_dir"
+    local prev_url prev_digest
+    prev_url="$(sed -n 's/^url = "\(.*\)"$/\1/p' "$previous")"
+    prev_digest="$(sed -n 's/^digest = "\(.*\)"$/\1/p' "$previous")"
+    download_capped "$prev_url" "$prev_dir/archive.tar.zst" &&
+      [ "sha256:$(sha256sum -- "$prev_dir/archive.tar.zst" | cut -d' ' -f1)" = "$prev_digest" ] &&
+      zstd -dc -- "$prev_dir/archive.tar.zst" | tar -x -C "$prev_dir" runtime.toml detect.toml || {
+      printf '\nThe previous admitted archive could not be fetched and re-verified.\n' >>"$SUMMARY"
+      return 0
+    }
+    {
+      printf '\n### diff -u against the previous admitted version\n\n```diff\n'
+      for file in runtime.toml detect.toml; do
+        diff -u -- "$prev_dir/$file" "$unpack/$file" || true
+      done
+      printf '```\n'
+    } >>"$SUMMARY"
+  fi
+}
+
+prove() {
+  local platform="$2"
+  load_entry "$1"
+  case " $PROVEN_PLATFORMS " in
+    *" $platform "*) ;;
+    *) fail "6 platform" "platform '$platform' cannot be proven" ;;
+  esac
+  archive="$WORK/$package_id-$version.tar.zst"
+  download_capped "$url" "$archive" || fail "6 download" "download failed or exceeded the cap"
+  [ "sha256:$(sha256sum -- "$archive" | cut -d' ' -f1)" = "$digest" ] ||
+    fail "6 digest" "archive sha256 differs from digest"
+
+  local core_sha daemon="pohunek-daemon-$core_version-$platform.tar.gz"
+  core_sha="$(tag_commit "$CORE_REPO" "$core_tag")"
+  mkdir -p "$WORK/release"
+  gh release download "$core_tag" --repo "$CORE_REPO" --pattern "$daemon" --dir "$WORK/release"
+  gh attestation verify "$WORK/release/$daemon" --repo "$CORE_REPO" \
+    --signer-workflow "$CORE_EVIDENCE_WORKFLOW" \
+    --signer-digest "$core_sha" \
+    --source-ref "refs/tags/$core_tag" \
+    --source-digest "$core_sha" \
+    --deny-self-hosted-runners || fail "6 core attestation" "the core daemon archive is not attested"
+  tar -xzf "$WORK/release/$daemon" -C "$WORK/release"
+
+  "$XTASK" plugin prove --archive "$archive" --entry "$WORK/added/$entry" \
+    --release-dir "$WORK/release/pohunek-daemon-$core_version-$platform" \
+    --evidence "$WORK/evidence-$platform.json" || fail "6 prove ($platform)" "xtask plugin prove failed"
+  printf '| 6 prove (%s) | pass |\n' "$platform" >>"$SUMMARY"
+}
+
+mode="${1:?usage: admit check <entry> | admit prove <entry> <platform>}"
+case "$mode" in
+  check) check "${2:?entry file required}" ;;
+  prove) prove "${2:?entry file required}" "${3:?platform required}" ;;
+  *) printf 'unknown mode\n' >&2; exit 2 ;;
+esac
