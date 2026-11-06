@@ -32,10 +32,13 @@ jobs:
         run: |
           set -euo pipefail
           entry_pattern='^official/[A-Za-z0-9._-]+/[A-Za-z0-9._+-]+\.toml$'
+          git diff --raw -z -M "$BASE_SHA"...HEAD >"$RUNNER_TEMP/changes.raw"
           added=()
+          deleted=()
           material=false
           failed=0
-          while IFS= read -r -d '' status; do
+          while IFS= read -r -d '' meta; do
+            IFS=' ' read -r _ new_mode _ _ status <<<"${meta#:}"
             IFS= read -r -d '' path
             second=""
             case "$status" in
@@ -44,15 +47,19 @@ jobs:
             case "$status" in
               A)
                 if [[ "$path" == official/* ]]; then
-                  if [[ "$path" =~ $entry_pattern ]]; then
+                  if [[ "$path" =~ $entry_pattern && "$new_mode" == 100644 ]]; then
                     added+=("$path")
                   elif [ "$path" != "official/.gitkeep" ]; then
-                    printf 'not an entry path: %q\n' "$path" >&2
+                    printf 'not a regular entry file: %q (mode %s)\n' "$path" "$new_mode" >&2
                     failed=1
                   fi
                 fi
                 ;;
-              D) ;;
+              D)
+                if [[ "$path" == official/* ]]; then
+                  deleted+=("$path")
+                fi
+                ;;
               *)
                 if [[ "$path" == official/* || "$second" == official/* ]]; then
                   printf 'an admitted entry may not be modified or renamed: %s %q %q\n' "$status" "$path" "$second" >&2
@@ -63,7 +70,13 @@ jobs:
             if [[ "$path" == keys/* || "$path" == revocations/* || "$second" == keys/* || "$second" == revocations/* ]]; then
               material=true
             fi
-          done < <(git diff --name-status -z -M "$BASE_SHA"...HEAD)
+          done <"$RUNNER_TEMP/changes.raw"
+          if [ "${#deleted[@]}" -gt 0 ]; then
+            {
+              printf '## De-admitted entries\n\n'
+              printf -- '- `%s`\n' "${deleted[@]}"
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi
           test "$failed" = 0
           entries="$(printf '%s\n' "${added[@]}" | jq -R . | jq -sc 'map(select(length > 0))')"
           matrix="$(jq -c '[.[] as $e | ({platform: "x86_64-unknown-linux-gnu", runner: "ubuntu-24.04"}, {platform: "aarch64-apple-darwin", runner: "macos-14"}) + {entry: $e}]' <<<"$entries")"
@@ -107,13 +120,14 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          args=(index verify --record keys/official.record.json --revocations revocations/revocations.json
-            --anchor core/packaging/runtime-catalog-anchor.json --channel core/packaging/plugin-index-channel.json)
+          root="$PWD"
+          args=(index verify --record "$root/keys/official.record.json" --revocations "$root/revocations/revocations.json"
+            --anchor "$root/core/packaging/runtime-catalog-anchor.json" --channel "$root/core/packaging/plugin-index-channel.json")
           if git cat-file -e "$BASE_SHA:revocations/revocations.json" 2>/dev/null; then
             git show "$BASE_SHA:revocations/revocations.json" >"$RUNNER_TEMP/previous-revocations.json"
             args+=(--previous-revocations "$RUNNER_TEMP/previous-revocations.json")
           fi
-          out="$(core/target/debug/xtask "${args[@]}")"
+          out="$(cd core && ./target/debug/xtask "${args[@]}")"
           printf '%s\n' "$out"
           [[ "$out" == "material verify ok: "* ]]
 
@@ -206,6 +220,7 @@ jobs:
           mkdir -p "$WORK"
           scripts/admit prove "$ENTRY" "$PLATFORM"
       - name: Name the evidence file
+        if: always()
         id: evidence
         env:
           ENTRY: ${{ matrix.entry }}

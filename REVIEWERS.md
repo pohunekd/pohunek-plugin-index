@@ -1,7 +1,7 @@
 # Reviewers
 
 `CODEOWNERS` names the reviewers of every path. A reviewer approving an entry
-reads the job summary of `admission / verdict`, not only the green checks:
+reads the job summaries of the `check` and `prove` jobs of the run, not only the green checks:
 
 - every predicate with its result;
 - the archive's `runtime.toml` and `detect.toml` verbatim: the launched

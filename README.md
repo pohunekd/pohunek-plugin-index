@@ -22,3 +22,9 @@ Admission never builds the pull request's own code before the checks that
 involve only the pinned core have passed, and the workflow has no secrets.
 Changes to `scripts/` and `.github/` run from the pull request itself, so a
 reviewer reads them before approving.
+
+Required repository settings (ruleset on `main`): the `admission / verdict`
+check, a pull request with a CODEOWNERS review, stale approvals dismissed,
+approval of the most recent push, and branches up to date before merging. The
+check is only as strong as that review, because a pull request runs its own
+copy of the workflow and of `scripts/admit`.
