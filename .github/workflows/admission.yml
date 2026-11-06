@@ -157,7 +157,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          export XTASK="$PWD/core/target/debug/xtask" BASE_REF="$BASE_SHA" WORK="$RUNNER_TEMP/admit" SUMMARY="$GITHUB_STEP_SUMMARY"
+          export CORE_DIR="$PWD/core" BASE_REF="$BASE_SHA" WORK="$RUNNER_TEMP/admit" SUMMARY="$GITHUB_STEP_SUMMARY"
           mkdir -p "$WORK"
           scripts/admit check "$ENTRY"
 
@@ -202,7 +202,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          export XTASK="$PWD/core/target/debug/xtask" BASE_REF="$BASE_SHA" WORK="$RUNNER_TEMP/admit" SUMMARY="$GITHUB_STEP_SUMMARY"
+          export CORE_DIR="$PWD/core" BASE_REF="$BASE_SHA" WORK="$RUNNER_TEMP/admit" SUMMARY="$GITHUB_STEP_SUMMARY"
           mkdir -p "$WORK"
           scripts/admit prove "$ENTRY" "$PLATFORM"
       - name: Name the evidence file

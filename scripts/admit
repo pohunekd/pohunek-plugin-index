@@ -5,7 +5,8 @@
 #   scripts/admit prove <entry-file> <platform> step 6 (one runner per platform)
 #
 # Every input arrives through the environment (set by admission.yml from `env:`):
-#   XTASK      xtask binary built at CORE_TAG (the only binary built before step 5)
+#   CORE_DIR   absolute path of the zajca/pohunek checkout at CORE_TAG, with xtask built
+#              in it (the only binary built before step 5); xtask runs only inside a checkout
 #   BASE_REF   git ref of the admitted tree (origin/main)
 #   WORK       empty scratch directory
 #   GH_TOKEN   read-only token for `gh api`, `gh release` and `gh attestation`
@@ -15,7 +16,7 @@
 # validated first, and every expansion below is quoted.
 set -euo pipefail
 
-: "${XTASK:?XTASK is required}"
+: "${CORE_DIR:?CORE_DIR is required}"
 : "${BASE_REF:?BASE_REF is required}"
 : "${WORK:?WORK is required}"
 : "${SUMMARY:?SUMMARY is required}"
@@ -28,6 +29,8 @@ readonly PROVEN_PLATFORMS="x86_64-unknown-linux-gnu aarch64-apple-darwin"
 readonly CORE_REPO="zajca/pohunek"
 readonly PLUGIN_RELEASE_WORKFLOW="zajca/pohunek/.github/workflows/plugin-release.yml"
 readonly CORE_EVIDENCE_WORKFLOW="zajca/pohunek/.github/workflows/release-evidence.yml"
+
+xtask() { (cd "$CORE_DIR" && ./target/debug/xtask "$@"); }
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
@@ -79,9 +82,9 @@ load_entry() {
   git -C "$root" archive "$BASE_REF" official | tar -x -C "$WORK/existing"
 
   local source_lines entry_lines key value
-  source_lines="$("$XTASK" index build --entries "$WORK/added" --print-source)" ||
+  source_lines="$(xtask index build --entries "$WORK/added" --print-source)" ||
     fail "1 schema" "xtask index build --print-source refused the entry"
-  entry_lines="$("$XTASK" index check-entry --entries "$WORK/added" --existing "$WORK/existing" \
+  entry_lines="$(xtask index check-entry --entries "$WORK/added" --existing "$WORK/existing" \
     --core-version "$core_version" --stage schema 2>&1)" ||
     fail "1 schema" "$entry_lines"
   source_repo="" source_repo_id="" source_tag="" source_commit="" source_built_with=""
@@ -160,7 +163,7 @@ check() {
   pass "5 rebuild"
 
   # Step 7: core range (pure; checked before the expensive proofs).
-  "$XTASK" index check-entry --entries "$WORK/added" --existing "$WORK/existing" \
+  xtask index check-entry --entries "$WORK/added" --existing "$WORK/existing" \
     --core-version "$core_version" --stage core-range >"$WORK/core-range.log" 2>&1 ||
     fail "7 core range" "$(cat "$WORK/core-range.log")"
   pass "7 core range"
@@ -196,7 +199,7 @@ rebuild() {
   rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' "$core_dir/rust-toolchain.toml")" --profile minimal
   (cd "$core_dir" && cargo build --locked -p xtask)
   mkdir -p "$WORK/rebuilt"
-  line="$("$core_dir/target/debug/xtask" plugin build --dir "$plugin_dir/package" --output-dir "$WORK/rebuilt")"
+  line="$(cd "$core_dir" && ./target/debug/xtask plugin build --dir "$plugin_dir/package" --output-dir "$WORK/rebuilt")"
   read -r _ _ _ built_id built_version built_digest _ <<<"$line"
   [ "$built_id" = "$package_id" ] && [ "$built_version" = "$version" ] && [ "$built_digest" = "$digest" ] ||
     fail "5 rebuild" "rebuilt $built_id $built_version $built_digest differs from the entry"
@@ -265,7 +268,7 @@ prove() {
     --deny-self-hosted-runners || fail "6 core attestation" "the core daemon archive is not attested"
   tar -xzf "$WORK/release/$daemon" -C "$WORK/release"
 
-  "$XTASK" plugin prove --archive "$archive" --entry "$WORK/added/$entry" \
+  xtask plugin prove --archive "$archive" --entry "$WORK/added/$entry" \
     --release-dir "$WORK/release/pohunek-daemon-$core_version-$platform" \
     --evidence "$WORK/evidence-$platform.json" || fail "6 prove ($platform)" "xtask plugin prove failed"
   printf '| 6 prove (%s) | pass |\n' "$platform" >>"$SUMMARY"
