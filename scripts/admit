@@ -78,7 +78,12 @@ load_entry() {
   cp --parents -- "$entry" "$WORK/added/"
   git -C "$root" archive "$BASE_REF" official | tar -x -C "$WORK/existing"
 
-  local line key value
+  local source_lines entry_lines key value
+  source_lines="$("$XTASK" index build --entries "$WORK/added" --print-source)" ||
+    fail "1 schema" "xtask index build --print-source refused the entry"
+  entry_lines="$("$XTASK" index check-entry --entries "$WORK/added" --existing "$WORK/existing" \
+    --core-version "$core_version" --stage schema 2>&1)" ||
+    fail "1 schema" "$entry_lines"
   source_repo="" source_repo_id="" source_tag="" source_commit="" source_built_with=""
   while IFS='=' read -r key value; do
     case "$key" in
@@ -89,7 +94,7 @@ load_entry() {
       built_with) source_built_with="$value" ;;
       *) fail "schema" "unexpected [source] key" ;;
     esac
-  done < <("$XTASK" index build --entries "$WORK/added" --print-source)
+  done <<<"$source_lines"
 
   while IFS='=' read -r key value; do
     case "$key" in
@@ -101,8 +106,7 @@ load_entry() {
       platforms) platforms="$value" ;;
       *) fail "schema" "unexpected entry key" ;;
     esac
-  done < <("$XTASK" index check-entry --entries "$WORK/added" --existing "$WORK/existing" \
-    --core-version "$core_version" --stage schema)
+  done <<<"$entry_lines"
 }
 
 check() {
@@ -111,7 +115,7 @@ check() {
   } >>"$SUMMARY"
 
   # Step 1: schema, identity and version order (typed [source] included).
-  load_entry "$1" || fail "1 schema" "xtask index check-entry or build --print-source refused the entry"
+  load_entry "$1"
   pass "1 schema"
 
   # Step 2: repository control, through qualified refs only.
