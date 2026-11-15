@@ -1,0 +1,262 @@
+# Signing and publication of the official plugin index. The `sign` job is the
+# only one that sees the signing key, and its only executable is the runner's
+# `openssl`: no checkout, no workspace-built code, no file from the artifact
+# is executed there. The daily schedule re-signs the same tree under the one
+# publish GO the owner gave (decision D-INDEX 2026-11-14): `build` recomputes
+# the sequence from the latest release, so each run publishes a higher one.
+#
+# Publishing stays off until the owner enables it: `build` exits 0 with
+# `publish=false` while the repository variable `INDEX_PUBLISH_ENABLED` is
+# not `true` or while `keys/official.record.json` is absent (the O4 record
+# PR must not trigger a live publish by itself). The owner creates the
+# `index-sign-official` environment (O5) before setting the variable.
+name: sign
+
+on:
+  push:
+    paths:
+      - official/**
+      - keys/**
+      - revocations/**
+      - CORE_TAG
+    branches:
+      - main
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sign
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      publish: ${{ steps.sign-build.outputs.publish }}
+      sequence: ${{ steps.sign-build.outputs.sequence }}
+      expires_at: ${{ steps.sign-build.outputs.expires_at }}
+      message_v1_digest: ${{ steps.sign-build.outputs.message_v1_digest }}
+      message_v2_digest: ${{ steps.sign-build.outputs.message_v2_digest }}
+      sums_digest: ${{ steps.sign-build.outputs.sums_digest }}
+    steps:
+      - name: Refuse a superseded run
+        id: guard
+        env:
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          main="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [ "$main" != "$HEAD_SHA" ]; then
+            printf 'publish=false\n' >>"$GITHUB_OUTPUT"
+            printf 'superseded: %s\n' "$main"
+            exit 0
+          fi
+          printf 'publish=run\n' >>"$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: steps.guard.outputs.publish == 'run'
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build the unsigned documents
+        id: sign-build
+        if: steps.guard.outputs.publish == 'run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INDEX_PUBLISH_ENABLED: ${{ vars.INDEX_PUBLISH_ENABLED }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sign"
+          scripts/sign-build official "$RUNNER_TEMP/sign" | tee "$RUNNER_TEMP/sign/outputs.txt"
+          grep -q '^publish=' "$RUNNER_TEMP/sign/outputs.txt"
+          grep '^publish=\|^sequence=\|^expires_at=\|^message_v1_digest=\|^message_v2_digest=\|^sums_digest=' \
+            "$RUNNER_TEMP/sign/outputs.txt" >>"$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.sign-build.outputs.publish == 'true'
+        with:
+          name: sign-input
+          path: ${{ runner.temp }}/sign/sign-input
+          if-no-files-found: error
+
+  sign:
+    name: sign
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: index-sign-official
+    permissions: {}
+    outputs:
+      signature_v1: ${{ steps.sign.outputs.signature_v1 }}
+      signature_v2: ${{ steps.sign.outputs.signature_v2 }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sign-input
+          path: in
+      - name: Check the messages
+        env:
+          MESSAGE_V1_DIGEST: ${{ needs.build.outputs.message_v1_digest }}
+          MESSAGE_V2_DIGEST: ${{ needs.build.outputs.message_v2_digest }}
+        run: |
+          set -euo pipefail
+          cd in
+          test "$(sha256sum message-v1.bin | cut -d' ' -f1)" = "$MESSAGE_V1_DIGEST"
+          test "$(sha256sum message-v2.bin | cut -d' ' -f1)" = "$MESSAGE_V2_DIGEST"
+          # K signs index bodies only. Both prefixes are 24 bytes long.
+          test "$(printf 'pohunek-plugin-index-v1\n' | wc -c)" -eq 24
+          test "$(printf 'pohunek-plugin-index-v2\n' | wc -c)" -eq 24
+          cmp -n 24 message-v1.bin <(printf 'pohunek-plugin-index-v1\n')
+          cmp -n 24 message-v2.bin <(printf 'pohunek-plugin-index-v2\n')
+      - name: Sign
+        id: sign
+        env:
+          INDEX_SIGNING_KEY_OFFICIAL: ${{ secrets.INDEX_SIGNING_KEY_OFFICIAL }}
+        run: |
+          set -euo pipefail
+          umask 077
+          dir="$(mktemp -d /dev/shm/index-key-XXXXXX)"
+          trap 'find "$dir" -type f -exec shred -u -- {} + 2>/dev/null; rm -rf -- "$dir"' EXIT
+          # The key file ends in one newline, which `gh secret set < file` may keep.
+          seed="${INDEX_SIGNING_KEY_OFFICIAL%$'\n'}"
+          unset INDEX_SIGNING_KEY_OFFICIAL
+          case "$seed" in
+            *[!0-9a-f]*) echo "the key is not lowercase hex" >&2; exit 1 ;;
+          esac
+          test "${#seed}" -eq 64
+          # PKCS#8 for an Ed25519 seed: fixed 16-byte prefix + 32-byte seed (RFC 8410).
+          # Builtin printf and a pipe keep the seed out of every process argv.
+          { printf '302E020100300506032B657004220420'
+            printf '%s' "$seed" | tr a-f A-F; } | basenc --base16 -d > "$dir/key.der"
+          unset seed
+          openssl pkey -inform DER -in "$dir/key.der" -out "$dir/key.pem"
+          public="$(openssl pkey -in "$dir/key.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')"
+          test "$public" = "$(jq -r .public_key in/official.record.json)"
+          for version in 1 2; do
+            openssl pkeyutl -sign -rawin -inkey "$dir/key.pem" -in "in/message-v$version.bin" -out "$dir/sig-v$version"
+            test "$(stat -c %s "$dir/sig-v$version")" -eq 64
+            printf 'signature_v%s=%s\n' "$version" "$(od -An -tx1 "$dir/sig-v$version" | tr -d ' \n')" >>"$GITHUB_OUTPUT"
+          done
+
+  publish:
+    name: publish
+    needs: [build, sign]
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sign-input
+          path: in
+      - name: Attach and verify
+        env:
+          SUMS_DIGEST: ${{ needs.build.outputs.sums_digest }}
+          SEQUENCE: ${{ needs.build.outputs.sequence }}
+          SIGNATURE_V1: ${{ needs.sign.outputs.signature_v1 }}
+          SIGNATURE_V2: ${{ needs.sign.outputs.signature_v2 }}
+        run: |
+          set -euo pipefail
+          cd in
+          test "$(sha256sum SHA256SUMS | cut -d' ' -f1)" = "$SUMS_DIGEST"
+          sha256sum --strict -c SHA256SUMS
+          # Artifact upload does not keep file modes; restore the one exec bit.
+          chmod 0755 xtask
+          key_id="$(jq -r .key_id official.record.json)"
+          printf '%s\n' "$SIGNATURE_V1" > signature-v1.hex
+          printf '%s\n' "$SIGNATURE_V2" > signature-v2.hex
+          ./xtask index attach --unsigned unsigned-v1.json \
+            --key-id "$key_id" --signature signature-v1.hex \
+            --anchor runtime-catalog-anchor.json --channel plugin-index-channel.json \
+            --output official-index-v1.json
+          ./xtask index attach --unsigned unsigned-v2.json \
+            --key-id "$key_id" --signature signature-v2.hex \
+            --anchor runtime-catalog-anchor.json --channel plugin-index-channel.json \
+            --output official-index-v2.json
+          for version in 1 2; do
+            ./xtask index verify --index "official-index-v$version.json" \
+              --anchor runtime-catalog-anchor.json --channel plugin-index-channel.json \
+              --index-high-water "$SEQUENCE"
+          done
+      - name: Publish and re-query
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEQUENCE: ${{ needs.build.outputs.sequence }}
+        run: |
+          set -euo pipefail
+          cd in
+          S="$SEQUENCE"
+          mkdir out && cp official-index-v1.json official-index-v2.json out/ &&
+            (cd out && sha256sum official-index-v1.json official-index-v2.json > SHA256SUMS)
+          gh release create "index-$S" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
+            --title "index-$S" --notes "Official plugin index, sequence $S."
+          gh release upload "index-$S" --repo "$GITHUB_REPOSITORY" out/official-index-v1.json out/official-index-v2.json out/SHA256SUMS
+          gh release edit "index-$S" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          for version in 1 2; do
+            curl -fsSL --max-filesize 1048576 -o "latest-v$version.json" \
+              "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/official-index-v$version.json"
+            ./xtask index verify --index "latest-v$version.json" \
+              --anchor runtime-catalog-anchor.json --channel plugin-index-channel.json \
+              --index-high-water "$S" | tee "verify-v$version.txt"
+            grep -q "sequence=$S " "verify-v$version.txt"
+          done
+          # Stale drafts and old releases never pile up: tags are never reused.
+          for tag in $(gh release list --repo "$GITHUB_REPOSITORY" --json tagName,isDraft \
+            --jq '.[] | select(.tagName | startswith("index-")) | select(.tagName != "index-'"$S"'") | .tagName'); do
+            created="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json createdAt --jq .createdAt)"
+            age_days="$(( ($(date -u +%s) - $(date -u -d "$created" +%s)) / 86400 ))"
+            is_draft="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"
+            if [ "$is_draft" = "true" ] || [ "$age_days" -gt 30 ]; then
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+            fi
+          done
+
+  liveness:
+    name: liveness
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Keep the schedule alive and watch the expiry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$(git log -1 --format=%ct)" -lt "$(($(date -u +%s) - 45 * 86400))" ]; then
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/sign.yml/enable"
+          fi
+          doc="$(curl -fsSL --max-filesize 1048576 \
+            "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/official-index-v2.json" || true)"
+          if [ -n "$doc" ]; then
+            expires_at="$(printf '%s' "$doc" | jq -r .index.expires_at)"
+            now="$(date -u +%s)"
+            if [ "$((expires_at - now))" -lt "$((3 * 86400))" ]; then
+              title="index liveness"
+              body="The published index expires at $expires_at, less than 3 days away."
+              number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" \
+                --json number --jq '.[0].number // empty')"
+              if [ -z "$number" ]; then
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+              else
+                gh issue comment --repo "$GITHUB_REPOSITORY" "$number" --body "$body"
+              fi
+            else
+              number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "index liveness in:title" \
+                --json number --jq '.[0].number // empty')"
+              [ -z "$number" ] || gh issue close --repo "$GITHUB_REPOSITORY" "$number"
+            fi
+          fi

@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Build the two unsigned official index documents (schema 1 and schema 2).
+#
+#   scripts/sign-build <entries-dir> <work-dir>
+#
+# Inputs arrive as arguments only: the checked-out `official/` tree and an
+# empty work directory. Everything else is read from the core checkout this
+# script runs from (`CORE_TAG` at the repository root): the key record, the
+# revocations, the anchor and the channel. The script builds the xtask at
+# `CORE_TAG`, re-checks every entry like admission does, computes the
+# sequence and expiry (D2), and writes both unsigned documents with their
+# signing messages. It prints `key=value` lines for the workflow:
+# `sequence`, `expires_at`, `message_v1_digest`, `message_v2_digest` and
+# `sums_digest`.
+#
+# Exit 0 with `publish=false` before any other step when publishing is
+# disabled or there is no key record; the workflow skips `sign` then.
+set -Eeuo pipefail
+
+entries_dir="${1:?entries directory required}"
+work_dir="${2:?work directory required}"
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+core_tag="$(cat "$root/CORE_TAG")"
+core_version="${core_tag#v}"
+
+if [ "${INDEX_PUBLISH_ENABLED:-}" != "true" ]; then
+  printf 'publish=false\n'
+  printf 'publishing disabled (INDEX_PUBLISH_ENABLED)\n' >&2
+  exit 0
+fi
+
+# A key record is an owner act (O4). Without one there is nothing to sign.
+if [ ! -f "$root/keys/official.record.json" ]; then
+  printf 'publish=false\n'
+  printf 'no key record: nothing to sign\n' >&2
+  exit 0
+fi
+
+[ -f "$root/revocations/revocations.json" ] ||
+  { printf 'revocations/revocations.json is missing\n' >&2; exit 1; }
+
+core_dir="$work_dir/core"
+rm -rf -- "$core_dir"
+git init -q "$core_dir"
+git -C "$core_dir" fetch -q --depth 1 "https://github.com/zajca/pohunek" "refs/tags/$core_tag"
+git -C "$core_dir" checkout -q --detach FETCH_HEAD
+rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' "$core_dir/rust-toolchain.toml")" --profile minimal
+(cd "$core_dir" && cargo build --locked -p xtask)
+
+xtask() { (cd "$core_dir" && ./target/debug/xtask "$@"); }
+
+# Every entry passes the admission predicates before it reaches a document:
+# schema first, then the core range, exactly as `scripts/admit` runs them.
+# `check-entry` takes the added entry alone against the tree without it, so
+# each entry is checked alone against the tree holding every other entry.
+full="$work_dir/full"
+single="$work_dir/single"
+without="$work_dir/without"
+rm -rf -- "$full" "$single" "$without"
+mkdir -p "$full"
+cp -r -- "$entries_dir" "$full/"
+while IFS= read -r -d '' entry; do
+  rel="${entry#"$full/"}"
+  rm -rf -- "$single" "$without"
+  mkdir -p -- "$single/$(dirname -- "$rel")"
+  cp -- "$entry" "$single/$rel"
+  cp -r -- "$full" "$without"
+  rm -- "$without/$rel"
+  rmdir -p -- "$without/$(dirname -- "$rel")" 2>/dev/null || true
+  [ -d "$without/official" ] || mkdir -p "$without/official"
+  [ -e "$without/official/.gitkeep" ] || [ -n "$(ls -A "$without/official")" ] || touch "$without/official/.gitkeep"
+  xtask index check-entry --entries "$single" --existing "$without" \
+    --core-version "$core_version" --stage schema >/dev/null
+  xtask index check-entry --entries "$single" --existing "$without" \
+    --core-version "$core_version" --stage core-range >/dev/null
+done < <(find "$full/official" -name '*.toml' -print0)
+
+# The previous release sets the floor: a rerun behind it never lowers it.
+previous=0
+if tag="$(gh release view --repo pohunekd/pohunek-plugin-index --json tagName \
+  --jq .tagName 2>/dev/null)" && [[ "$tag" =~ ^index-([0-9]+)$ ]]; then
+  previous="${BASH_REMATCH[1]}"
+fi
+now="$(date -u +%s)"
+sequence="$now"
+[ "$((previous + 1))" -gt "$sequence" ] && sequence="$((previous + 1))"
+expires_at="$((sequence + 604800))"
+
+# The v1 tree holds runtime entries only: an entry with a `runtime_id` field
+# (schema 2 files may also carry a `kind` field, which plain `runtime` files
+# omit). The v2 tree holds every entry.
+tree_v1="$work_dir/tree-v1"
+tree_v2="$work_dir/tree-v2"
+rm -rf -- "$tree_v1" "$tree_v2"
+mkdir -p "$tree_v1/official" "$tree_v2/official"
+cp -r -- "$entries_dir/." "$tree_v2/official/"
+find "$tree_v2/official" -name '*.toml' -print0 | while IFS= read -r -d '' file; do
+  rel="${file#"$tree_v2/official/"}"
+  if grep -q '^runtime_id' -- "$file"; then
+    dest="$tree_v1/official/$rel"
+    mkdir -p -- "$(dirname -- "$dest")"
+    cp -- "$file" "$dest"
+  fi
+done
+[ -n "$(ls -A "$tree_v1/official")" ] || touch "$tree_v1/official/.gitkeep"
+[ -n "$(ls -A "$tree_v2/official")" ] || touch "$tree_v2/official/.gitkeep"
+
+out="$work_dir/sign-input"
+rm -rf -- "$out"
+mkdir -p "$out"
+cp -- "$root/keys/official.record.json" "$out/official.record.json"
+cp -- "$root/revocations/revocations.json" "$out/revocations.json"
+cp -- "$core_dir/packaging/runtime-catalog-anchor.json" "$out/runtime-catalog-anchor.json"
+cp -- "$core_dir/packaging/plugin-index-channel.json" "$out/plugin-index-channel.json"
+xtask index build --entries "$work_dir/tree-v1" --schema-version 1 \
+  --revocations "$out/revocations.json" --key-record "$out/official.record.json" \
+  --sequence "$sequence" --expires-at "$expires_at" --output "$out/unsigned-v1.json"
+xtask index build --entries "$work_dir/tree-v2" --schema-version 2 \
+  --revocations "$out/revocations.json" --key-record "$out/official.record.json" \
+  --sequence "$sequence" --expires-at "$expires_at" --output "$out/unsigned-v2.json"
+xtask index message --unsigned "$out/unsigned-v1.json" --output "$out/message-v1.bin"
+xtask index message --unsigned "$out/unsigned-v2.json" --output "$out/message-v2.bin"
+printf '%s\n' "$sequence" >"$out/sequence"
+cp -- "$core_dir/target/debug/xtask" "$out/xtask"
+(cd "$out" && sha256sum unsigned-v1.json unsigned-v2.json message-v1.bin message-v2.bin \
+  official.record.json revocations.json runtime-catalog-anchor.json \
+  plugin-index-channel.json xtask sequence >SHA256SUMS)
+
+message_v1_digest="$(sha256sum -- "$out/message-v1.bin" | cut -d' ' -f1)"
+message_v2_digest="$(sha256sum -- "$out/message-v2.bin" | cut -d' ' -f1)"
+sums_digest="$(sha256sum -- "$out/SHA256SUMS" | cut -d' ' -f1)"
+{
+  printf 'publish=true\n'
+  printf 'sequence=%s\n' "$sequence"
+  printf 'expires_at=%s\n' "$expires_at"
+  printf 'message_v1_digest=%s\n' "$message_v1_digest"
+  printf 'message_v2_digest=%s\n' "$message_v2_digest"
+  printf 'sums_digest=%s\n' "$sums_digest"
+}
