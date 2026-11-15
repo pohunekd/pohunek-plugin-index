@@ -158,8 +158,11 @@ check_one() {
     printf 'sign-build: %s: archive sha256 differs from digest\n' "$rel" >&2
     return 1
   }
+  # The attested signer digest is the annotated tag object of the named core
+  # release, not its commit: `plugin-release.yml` runs as
+  # `<workflow>@refs/tags/<core-tag>`, pinned to the tag object.
   local built_sha=""
-  built_sha="$(gh api "repos/$CORE_REPO/commits/refs/tags/$source_built_with" --jq .sha)" || {
+  built_sha="$(gh api "repos/$CORE_REPO/git/refs/tags/$source_built_with" --jq .object.sha)" || {
     printf 'sign-build: %s: refs/tags/%s does not resolve in %s\n' "$rel" "$source_built_with" "$CORE_REPO" >&2
     return 1
   }
