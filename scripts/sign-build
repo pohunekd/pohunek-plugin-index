@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
-# Build the two unsigned official index documents (schema 1 and schema 2).
+# Recheck every admitted entry before it reaches a document, then build the
+# two unsigned official index documents (schema 1 and schema 2).
 #
 #   scripts/sign-build <entries-dir> <work-dir>
 #
 # Inputs arrive as arguments only: the checked-out `official/` tree and an
-# empty work directory. Everything else is read from the core checkout this
-# script runs from (`CORE_TAG` at the repository root): the key record, the
-# revocations, the anchor and the channel. The script builds the xtask at
-# `CORE_TAG`, re-checks every entry like admission does, computes the
-# sequence and expiry (D2), and writes both unsigned documents with their
-# signing messages. It prints `key=value` lines for the workflow:
-# `sequence`, `expires_at`, `message_v1_digest`, `message_v2_digest` and
-# `sums_digest`.
+# empty work directory. Everything else is read from files: the core checkout
+# (for `CORE_TAG`, the key record and the revocations at the repository root,
+# and the anchor and channel from the core checkout's `packaging/`), and a
+# `GH_TOKEN` in the environment for the read-only API checks.
+#
+# The recheck runs #1938 D1 step 3 over every entry (repo control, archive
+# digest, attestation of the plugin release; API-only, no plugin code runs).
+# It deliberately replays no add-time admission predicate: no version order
+# and no core-range match against the current `CORE_TAG`. Both keep passing
+# for entries that were admitted together, and a CORE_TAG bump past an
+# entry's upper bound must not stop the daily re-sign.
+#
+# The script prints `key=value` lines for the workflow: `publish`, then on a
+# live run `core_sha`, `previous`, `sequence`, `expires_at`,
+# `message_v1_digest`, `message_v2_digest` and `sums_digest`.
 #
 # Exit 0 with `publish=false` before any other step when publishing is
 # disabled or there is no key record; the workflow skips `sign` then.
@@ -37,75 +45,174 @@ if [ ! -f "$root/keys/official.record.json" ]; then
   exit 0
 fi
 
+: "${GH_TOKEN:?GH_TOKEN is required}"
 [ -f "$root/revocations/revocations.json" ] ||
   { printf 'revocations/revocations.json is missing\n' >&2; exit 1; }
+
+readonly CORE_REPO="zajca/pohunek"
+readonly PLUGIN_RELEASE_WORKFLOW="zajca/pohunek/.github/workflows/plugin-release.yml"
+# Largest plugin archive rechecked, the same cap `scripts/admit` uses.
+readonly MAX_ARCHIVE_BYTES=$((8 * 1024 * 1024))
+
+# sha256 of a file as lowercase hex.
+sha256() {
+  sha256sum -- "$1" | cut -d' ' -f1
+}
 
 core_dir="$work_dir/core"
 rm -rf -- "$core_dir"
 git init -q "$core_dir"
-git -C "$core_dir" fetch -q --depth 1 "https://github.com/zajca/pohunek" "refs/tags/$core_tag"
+git -C "$core_dir" fetch -q --depth 1 "https://github.com/$CORE_REPO" "refs/tags/$core_tag"
 git -C "$core_dir" checkout -q --detach FETCH_HEAD
+core_sha="$(git -C "$core_dir" rev-parse HEAD)"
 rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' "$core_dir/rust-toolchain.toml")" --profile minimal
 (cd "$core_dir" && cargo build --locked -p xtask)
 
 xtask() { (cd "$core_dir" && ./target/debug/xtask "$@"); }
 
-# Every entry passes the admission predicates before it reaches a document:
-# schema first, then the core range, exactly as `scripts/admit` runs them.
-# `check-entry` takes the added entry alone against the tree without it, so
-# each entry is checked alone against the tree holding every other entry.
-full="$work_dir/full"
-single="$work_dir/single"
-without="$work_dir/without"
-rm -rf -- "$full" "$single" "$without"
-mkdir -p "$full"
-cp -r -- "$entries_dir" "$full/"
-while IFS= read -r -d '' entry; do
-  rel="${entry#"$full/"}"
-  rm -rf -- "$single" "$without"
+# Every admitted entry still names its own repository, digest and release:
+# #1938 D1 step 3 over the whole `official/` tree.
+check_all() {
+  local full="$1"
+  while IFS= read -r -d '' entry; do
+    check_one "$entry"
+  done < <(find "$full/official" -name '*.toml' -print0)
+}
+
+check_one() {
+  local entry="$1" rel="${1#"$full/"}"
+  local single="$work_dir/single"
+  rm -rf -- "$single"
   mkdir -p -- "$single/$(dirname -- "$rel")"
   cp -- "$entry" "$single/$rel"
-  cp -r -- "$full" "$without"
-  rm -- "$without/$rel"
-  rmdir -p -- "$without/$(dirname -- "$rel")" 2>/dev/null || true
-  [ -d "$without/official" ] || mkdir -p "$without/official"
-  [ -e "$without/official/.gitkeep" ] || [ -n "$(ls -A "$without/official")" ] || touch "$without/official/.gitkeep"
-  xtask index check-entry --entries "$single" --existing "$without" \
-    --core-version "$core_version" --stage schema >/dev/null
-  xtask index check-entry --entries "$single" --existing "$without" \
-    --core-version "$core_version" --stage core-range >/dev/null
-done < <(find "$full/official" -name '*.toml' -print0)
+  local source_lines
+  source_lines="$(xtask index build --entries "$single" --print-source)" || {
+    printf 'sign-build: %s: schema refused the entry\n' "$rel" >&2
+    return 1
+  }
+  local source_repo="" source_repo_id="" source_tag="" source_commit="" source_built_with=""
+  local key="" value=""
+  while IFS='=' read -r key value; do
+    case "$key" in
+      repo) source_repo="$value" ;;
+      repo_id) source_repo_id="$value" ;;
+      tag) source_tag="$value" ;;
+      commit) source_commit="$value" ;;
+      built_with) source_built_with="$value" ;;
+      *) printf 'sign-build: %s: unexpected [source] key\n' "$rel" >&2; return 1 ;;
+    esac
+  done <<<"$source_lines"
 
-# The previous release sets the floor: a rerun behind it never lowers it.
+  # Step 2 of the admission check steps: the repository still belongs to the
+  # id, and the tag still resolves to the commit through its qualified ref.
+  [ "$(gh api "repos/$source_repo" --jq .id)" = "$source_repo_id" ] || {
+    printf 'sign-build: %s: repository id differs from repo_id\n' "$rel" >&2
+    return 1
+  }
+  local tag_sha=""
+  tag_sha="$(gh api "repos/$source_repo/commits/refs/tags/$source_tag" --jq .sha)" || {
+    printf 'sign-build: %s: refs/tags/%s does not resolve\n' "$rel" "$source_tag" >&2
+    return 1
+  }
+  [ "$tag_sha" = "$source_commit" ] || {
+    printf 'sign-build: %s: tag commit differs from commit\n' "$rel" >&2
+    return 1
+  }
+
+  # Step 3: the release asset at the tag still hashes to the digest, and the
+  # core release workflow attested it.
+  local entry_lines=""
+  entry_lines="$(xtask index check-entry --entries "$single" --existing "$work_dir/empty" \
+    --core-version "$core_version" --stage schema 2>/dev/null)" || entry_lines=""
+  local package_id="" version="" digest="" url="" key2="" value2=""
+  while IFS='=' read -r key2 value2; do
+    case "$key2" in
+      package_id) package_id="$value2" ;;
+      version) version="$value2" ;;
+      digest) digest="$value2" ;;
+      url) url="$value2" ;;
+    esac
+  done <<<"$entry_lines"
+  [ -n "$package_id" ] && [ -n "$version" ] && [ -n "$digest" ] && [ -n "$url" ] || {
+    printf 'sign-build: %s: schema refused the entry\n' "$rel" >&2
+    return 1
+  }
+  [ "$url" = "https://github.com/$source_repo/releases/download/$source_tag/$package_id-$version.tar.zst" ] || {
+    printf 'sign-build: %s: url is not the release asset of the tag\n' "$rel" >&2
+    return 1
+  }
+  local archive="$work_dir/archive-$package_id-$version.tar.zst"
+  if ! curl --proto '=https' --tlsv1.2 --max-redirs 5 --fail --silent --show-error --location \
+    --max-filesize "$MAX_ARCHIVE_BYTES" "$url" 2>/dev/null |
+    head -c "$((MAX_ARCHIVE_BYTES + 1))" >"$archive"; then
+    printf 'sign-build: %s: download failed\n' "$rel" >&2
+    return 1
+  fi
+  local size
+  size="$(wc -c <"$archive")"
+  [ "$size" -gt 0 ] && [ "$size" -le "$MAX_ARCHIVE_BYTES" ] || {
+    printf 'sign-build: %s: download failed or exceeded the cap\n' "$rel" >&2
+    return 1
+  }
+  [ "sha256:$(sha256 "$archive")" = "$digest" ] || {
+    printf 'sign-build: %s: archive sha256 differs from digest\n' "$rel" >&2
+    return 1
+  }
+  local built_sha=""
+  built_sha="$(gh api "repos/$CORE_REPO/commits/refs/tags/$source_built_with" --jq .sha)" || {
+    printf 'sign-build: %s: refs/tags/%s does not resolve in %s\n' "$rel" "$source_built_with" "$CORE_REPO" >&2
+    return 1
+  }
+  local release_state=""
+  release_state="$(gh release view "$source_built_with" --repo "$CORE_REPO" --json isDraft,isPrerelease \
+    --jq '(.isDraft | not) and (.isPrerelease | not)')" || release_state="false"
+  [ "$release_state" = "true" ] || {
+    printf 'sign-build: %s: %s is a draft, a pre-release or missing\n' "$rel" "$source_built_with" >&2
+    return 1
+  }
+  gh attestation verify "$archive" --repo "$source_repo" \
+    --signer-workflow "$PLUGIN_RELEASE_WORKFLOW" \
+    --signer-digest "$built_sha" \
+    --source-ref "refs/tags/$source_tag" \
+    --source-digest "$source_commit" \
+    --deny-self-hosted-runners >"$work_dir/attestation.log" 2>&1 || {
+    printf 'sign-build: %s: attestation failed\n' "$rel" >&2
+    return 1
+  }
+  return 0
+}
+
+full="$work_dir/full"
+rm -rf -- "$full" "$work_dir/empty" "$work_dir/single"
+mkdir -p "$full" "$work_dir/empty/official"
+touch "$work_dir/empty/official/.gitkeep"
+cp -r -- "$entries_dir/." "$full/official/"
+check_all "$full"
+
+# The previous release sets the floor: a rerun behind it never publishes a
+# lower sequence. A missing release means none exists yet; any other gh
+# failure or an unexpected latest tag stops the run.
 previous=0
-if tag="$(gh release view --repo pohunekd/pohunek-plugin-index --json tagName \
-  --jq .tagName 2>/dev/null)" && [[ "$tag" =~ ^index-([0-9]+)$ ]]; then
+if latest_tag="$(gh api "repos/pohunekd/pohunek-plugin-index/releases/latest" \
+  --jq .tag_name 2>"$work_dir/latest.err")"; then
+  [[ "$latest_tag" =~ ^index-([0-9]+)$ ]] || {
+    printf 'sign-build: latest release %s is not index-N\n' "$latest_tag" >&2
+    exit 1
+  }
   previous="${BASH_REMATCH[1]}"
+elif grep -q "HTTP 404" "$work_dir/latest.err" 2>/dev/null || grep -q '"status":"404"' "$work_dir/latest.err" 2>/dev/null; then
+  previous=0
+else
+  printf 'sign-build: latest release lookup failed: %s\n' \
+    "$(head -c 300 "$work_dir/latest.err")" >&2
+  exit 1
 fi
 now="$(date -u +%s)"
 sequence="$now"
 [ "$((previous + 1))" -gt "$sequence" ] && sequence="$((previous + 1))"
 expires_at="$((sequence + 604800))"
 
-# The v1 tree holds runtime entries only: an entry with a `runtime_id` field
-# (schema 2 files may also carry a `kind` field, which plain `runtime` files
-# omit). The v2 tree holds every entry.
-tree_v1="$work_dir/tree-v1"
-tree_v2="$work_dir/tree-v2"
-rm -rf -- "$tree_v1" "$tree_v2"
-mkdir -p "$tree_v1/official" "$tree_v2/official"
-cp -r -- "$entries_dir/." "$tree_v2/official/"
-find "$tree_v2/official" -name '*.toml' -print0 | while IFS= read -r -d '' file; do
-  rel="${file#"$tree_v2/official/"}"
-  if grep -q '^runtime_id' -- "$file"; then
-    dest="$tree_v1/official/$rel"
-    mkdir -p -- "$(dirname -- "$dest")"
-    cp -- "$file" "$dest"
-  fi
-done
-[ -n "$(ls -A "$tree_v1/official")" ] || touch "$tree_v1/official/.gitkeep"
-[ -n "$(ls -A "$tree_v2/official")" ] || touch "$tree_v2/official/.gitkeep"
-
+# One tree feeds both schemas; core filters context entries out of schema 1.
 out="$work_dir/sign-input"
 rm -rf -- "$out"
 mkdir -p "$out"
@@ -113,25 +220,27 @@ cp -- "$root/keys/official.record.json" "$out/official.record.json"
 cp -- "$root/revocations/revocations.json" "$out/revocations.json"
 cp -- "$core_dir/packaging/runtime-catalog-anchor.json" "$out/runtime-catalog-anchor.json"
 cp -- "$core_dir/packaging/plugin-index-channel.json" "$out/plugin-index-channel.json"
-xtask index build --entries "$work_dir/tree-v1" --schema-version 1 \
+xtask index build --entries "$full" --schema-version 1 \
   --revocations "$out/revocations.json" --key-record "$out/official.record.json" \
   --sequence "$sequence" --expires-at "$expires_at" --output "$out/unsigned-v1.json"
-xtask index build --entries "$work_dir/tree-v2" --schema-version 2 \
+xtask index build --entries "$full" --schema-version 2 \
   --revocations "$out/revocations.json" --key-record "$out/official.record.json" \
   --sequence "$sequence" --expires-at "$expires_at" --output "$out/unsigned-v2.json"
 xtask index message --unsigned "$out/unsigned-v1.json" --output "$out/message-v1.bin"
 xtask index message --unsigned "$out/unsigned-v2.json" --output "$out/message-v2.bin"
+printf '%s\n' "$core_sha" >"$out/core-sha"
 printf '%s\n' "$sequence" >"$out/sequence"
-cp -- "$core_dir/target/debug/xtask" "$out/xtask"
 (cd "$out" && sha256sum unsigned-v1.json unsigned-v2.json message-v1.bin message-v2.bin \
   official.record.json revocations.json runtime-catalog-anchor.json \
-  plugin-index-channel.json xtask sequence >SHA256SUMS)
+  plugin-index-channel.json core-sha sequence >SHA256SUMS)
 
 message_v1_digest="$(sha256sum -- "$out/message-v1.bin" | cut -d' ' -f1)"
 message_v2_digest="$(sha256sum -- "$out/message-v2.bin" | cut -d' ' -f1)"
 sums_digest="$(sha256sum -- "$out/SHA256SUMS" | cut -d' ' -f1)"
 {
   printf 'publish=true\n'
+  printf 'core_sha=%s\n' "$core_sha"
+  printf 'previous=%s\n' "$previous"
   printf 'sequence=%s\n' "$sequence"
   printf 'expires_at=%s\n' "$expires_at"
   printf 'message_v1_digest=%s\n' "$message_v1_digest"
