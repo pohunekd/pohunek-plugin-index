@@ -1,0 +1,11 @@
+{
+  "revocations": {
+    "schema_version": 1,
+    "sequence": 1,
+    "revoked_key_ids": []
+  },
+  "signature": {
+    "key_id": "f52cf66e089130ee817e18db5b52db21ee6b002c29615f47d80b168931ba89fe",
+    "signature": "cd7914f1d1d2c05d6bab9854a3b55ea53d52397bcfb42296db57d2c98d592b0af7fedfe15b76ca2235c4fc5534e5a25db407b782e1d8e4ce280d1e35759b0e06"
+  }
+}
