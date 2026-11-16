@@ -194,27 +194,30 @@ jobs:
         run: |
           set -euo pipefail
           cd in
+          in_dir="$PWD"
           test "$SEQUENCE" -gt "$PREVIOUS"
           test "$(sha256sum SHA256SUMS | cut -d' ' -f1)" = "$SUMS_DIGEST"
           sha256sum --strict -c SHA256SUMS
           mkdir -p signed
           rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' ../core/rust-toolchain.toml)" --profile minimal
           (cd ../core && cargo build --locked -p xtask)
+          # xtask refuses to run outside a pohunek checkout, so it runs from core/ and
+          # every file argument is an absolute path into the input directory.
           xtask() { (cd ../core && ./target/debug/xtask "$@"); }
           key_id="$(jq -r .key_id official.record.json)"
           printf '%s\n' "$SIGNATURE_V1" > signature-v1.hex
           printf '%s\n' "$SIGNATURE_V2" > signature-v2.hex
-          xtask index attach --unsigned unsigned-v1.json \
-            --key-id "$key_id" --signature signature-v1.hex \
-            --anchor runtime-catalog-anchor.json --channel plugin-index-channel.json \
-            --output signed/official-index-v1.json
-          xtask index attach --unsigned unsigned-v2.json \
-            --key-id "$key_id" --signature signature-v2.hex \
-            --anchor runtime-catalog-anchor.json --channel plugin-index-channel.json \
-            --output signed/official-index-v2.json
+          xtask index attach --unsigned "$in_dir/unsigned-v1.json" \
+            --key-id "$key_id" --signature "$in_dir/signature-v1.hex" \
+            --anchor "$in_dir/runtime-catalog-anchor.json" --channel "$in_dir/plugin-index-channel.json" \
+            --output "$in_dir/signed/official-index-v1.json"
+          xtask index attach --unsigned "$in_dir/unsigned-v2.json" \
+            --key-id "$key_id" --signature "$in_dir/signature-v2.hex" \
+            --anchor "$in_dir/runtime-catalog-anchor.json" --channel "$in_dir/plugin-index-channel.json" \
+            --output "$in_dir/signed/official-index-v2.json"
           for version in 1 2; do
-            xtask index verify --index "signed/official-index-v$version.json" \
-              --anchor runtime-catalog-anchor.json --channel plugin-index-channel.json \
+            xtask index verify --index "$in_dir/signed/official-index-v$version.json" \
+              --anchor "$in_dir/runtime-catalog-anchor.json" --channel "$in_dir/plugin-index-channel.json" \
               --index-high-water "$SEQUENCE"
           done
           printf 'document_v1_digest=%s\n' "$(sha256sum signed/official-index-v1.json | cut -d' ' -f1)" >>"$GITHUB_OUTPUT"
