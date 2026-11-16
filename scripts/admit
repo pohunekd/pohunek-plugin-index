@@ -172,16 +172,24 @@ check() {
     fail "3 digest" "archive sha256 differs from digest"
   pass "3 archive"
 
-  # Step 4: attestation by the core release workflow, identity pinned to the
-  # commit of the built_with tag of zajca/pohunek itself.
-  local built_sha
+  # Step 4: attestation by the core release workflow. The attested signer
+  # digest is the annotated tag object of the named release, not its commit:
+  # `plugin-release.yml` runs as `<workflow>@refs/tags/<core-tag>`, pinned
+  # to the tag object. `tag_commit` resolves `refs/tags/<tag>` through the
+  # commits API, which follows the annotation to the commit.
+  local built_tag built_sha
+  built_tag="$(gh api "repos/$CORE_REPO/git/refs/tags/$source_built_with" --jq .object.sha \
+    2>"$WORK/built-tag.err")" ||
+    fail "4 built_with" "refs/tags/$source_built_with does not resolve in $CORE_REPO: $(head -c 300 "$WORK/built-tag.err")"
   built_sha="$(tag_commit "$CORE_REPO" "$source_built_with")" ||
     fail "4 built_with" "refs/tags/$source_built_with does not resolve in $CORE_REPO"
+  [ "$built_tag" != "$built_sha" ] ||
+    fail "4 built_with" "$source_built_with is a lightweight tag; the signer digest needs the annotated tag object"
   require_published_release "$CORE_REPO" "$source_built_with" ||
     fail "4 built_with release" "$source_built_with is a draft, a pre-release or missing"
   gh attestation verify "$archive" --repo "$source_repo" \
     --signer-workflow "$PLUGIN_RELEASE_WORKFLOW" \
-    --signer-digest "$built_sha" \
+    --signer-digest "$built_tag" \
     --source-ref "refs/tags/$source_tag" \
     --source-digest "$source_commit" \
     --deny-self-hosted-runners >"$WORK/attestation.log" 2>&1 ||

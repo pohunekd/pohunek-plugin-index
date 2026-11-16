@@ -9,14 +9,27 @@ The list of plugins that install by id with `pohunek plugin install <id>`.
   checks and whose daemon archive proves each entry.
 - `scripts/admit` and `.github/workflows/admission.yml` prove every added entry.
   The `admission / verdict` check is required on `main`.
+- `scripts/sign-build` and `.github/workflows/sign.yml` sign and publish the
+  official index every day: schema 1 (`official-index-v1.json`, runtime
+  entries only) beside schema 2 (`official-index-v2.json`, runtime and
+  context entries), under the same key and sequence. The key reaches only
+  the runner's `openssl` in the `sign` job; every other job is keyless.
+  Publishing stays off until the owner sets the repository variable
+  `INDEX_PUBLISH_ENABLED` to `true` (after the key ceremony). Until then
+  the schedule and pushes stay green and publish nothing.
 - `keys/official.record.json` and `revocations/revocations.json` hold the
   public key material of the index signing key; they change only through a
   reviewed pull request that the `material` job verifies.
 
 An entry file lists the signed fields (`package_id`, `runtime_id`, `version`,
 `digest`, `url`, `platforms`, `core`) and a `[source]` table (`repo`, `repo_id`,
-`tag`, `commit`, `built_with`). The format and the admission steps are described
+`tag`, `commit`, `built_with`). A `context` entry names `kind = "context"` and
+no `runtime_id`; the v1 document then omits it while the v2 document lists it.
+The format and the admission steps are described
 in the Pohunek guide "Plugin repositories".
+
+The plugin keeps its package in the `package/` directory, the default of the
+core release workflow; admission refuses any other layout.
 
 Admission never builds the pull request's own code before the checks that
 involve only the pinned core have passed, and the workflow has no secrets.
