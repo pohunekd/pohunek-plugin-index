@@ -248,16 +248,36 @@ rebuild() {
     fail "5 rebuild" "rebuilt $built_id $built_version $built_digest differs from the entry"
 }
 
-# The reviewer approves the launched program, args, launch_env, [integration]
-# and requires, not only the green checks.
 # Extracts runtime.toml and the detection manifest it names into `$2` from the
-# archive `$1`. The manifest path comes from the archive, so it is limited to a
-# relative path of safe characters. Returns 1 when either file is unavailable.
+# archive `$1`. Reads [runtime] detect_manifest, the same table path the daemon
+# parses (crates/daemon/src/agent/host/definition.rs:1436, read at :750). The
+# manifest path comes from the archive, so it is limited to a relative path of
+# safe characters. Returns 1 when either file is unavailable.
 unpack_views() {
-  local archive_file="$1" dir="$2" manifest
+  local archive_file="$1" dir="$2" manifest rc
   mkdir -p "$dir"
   zstd -dc -- "$archive_file" | tar -x -C "$dir" runtime.toml || return 1
-  manifest="$(sed -n 's/^detect_manifest = "\(.*\)"$/\1/p' "$dir/runtime.toml" | head -n 1)"
+  command -v python3 >/dev/null 2>&1 || fail "reviewer view" "python3 is required to read [runtime] detect_manifest"
+  manifest="$(python3 -I - "$dir/runtime.toml" <<'PYEOF'
+import sys
+try:
+    import tomllib
+except ImportError:
+    sys.exit(2)
+try:
+    with open(sys.argv[1], "rb") as handle:
+        document = tomllib.load(handle)
+    value = document["runtime"]["detect_manifest"]
+except (OSError, KeyError, TypeError, ValueError):
+    sys.exit(1)
+if not isinstance(value, str):
+    sys.exit(1)
+sys.stdout.write(value)
+PYEOF
+)"
+  rc="$?"
+  [ "$rc" -eq 2 ] && fail "reviewer view" "python3 tomllib is required to read [runtime] detect_manifest"
+  [ "$rc" -ne 0 ] && return 1
   case "$manifest" in
     "" | -* | /* | *..* | *[!A-Za-z0-9._/-]*) return 1 ;;
   esac
