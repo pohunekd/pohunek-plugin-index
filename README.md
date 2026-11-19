@@ -28,8 +28,9 @@ no `runtime_id`; the v1 document then omits it while the v2 document lists it.
 The format and the admission steps are described
 in the Pohunek guide "Plugin repositories".
 
-The plugin keeps its package in the `package/` directory, the default of the
-core release workflow; admission refuses any other layout.
+A package submitted to the official index must live in `package/`: index
+admission rebuilds the archive from the `package` directory and refuses any
+other layout (`scripts/admit`, the "5 package-dir" check).
 
 Admission never builds the pull request's own code before the checks that
 involve only the pinned core have passed, and the workflow has no secrets.
