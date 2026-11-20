@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Proves ONE admitted entry on ONE platform against the latest core release.
+#
+#   scripts/reprove-prove <entry-file> <platform>
+#
+# Inputs arrive through the environment (set by reprove.yml from `env:`):
+#   CORE_DIR   absolute path of the zajca/pohunek checkout at LATEST, with xtask
+#              built in it; xtask runs only inside a checkout
+#   LATEST     the core release tag, vX.Y.Z
+#   WORK       empty scratch directory
+#   GH_TOKEN   read-only token for `gh release` and `gh attestation`
+#
+# The proof evidence lands in `$WORK/evidence-<platform>.json`. A step that
+# fails before `xtask plugin prove` writes no evidence; the report job treats a
+# missing evidence file as a failed row.
+set -Eeuo pipefail
+
+: "${CORE_DIR:?CORE_DIR is required}"
+: "${LATEST:?LATEST is required}"
+: "${WORK:?WORK is required}"
+: "${GH_TOKEN:?GH_TOKEN is required}"
+
+entry="${1:?entry file required}"
+platform="${2:?platform required}"
+
+# Largest plugin archive proven, the same cap `scripts/admit` uses.
+readonly MAX_ARCHIVE_BYTES=$((8 * 1024 * 1024))
+readonly CORE_REPO="zajca/pohunek"
+readonly CORE_EVIDENCE_WORKFLOW="zajca/pohunek/.github/workflows/release-evidence.yml"
+readonly PROVEN_PLATFORMS="x86_64-unknown-linux-gnu aarch64-apple-darwin"
+
+xtask() { (cd "$CORE_DIR" && ./target/debug/xtask "$@"); }
+
+die() {
+  printf 'reprove-prove: %s\n' "$1" >&2
+  exit 1
+}
+
+# sha256 of a file as lowercase hex; macOS runners ship shasum, not sha256sum.
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -- "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 -- "$1" | cut -d' ' -f1
+  fi
+}
+
+[[ "$LATEST" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "LATEST is not vX.Y.Z"
+core_version="${LATEST#v}"
+case " $PROVEN_PLATFORMS " in
+  *" $platform "*) ;;
+  *) die "platform '$platform' cannot be proven" ;;
+esac
+[[ "$entry" =~ ^official/[A-Za-z0-9._-]+/[0-9]+\.[0-9]+\.[0-9]+\.toml$ ]] || die "not an entry path: $entry"
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+
+# The entry is checked against an empty tree: it is already admitted.
+rm -rf -- "$WORK/one" "$WORK/empty"
+mkdir -p -- "$WORK/empty/official" "$WORK/one/$(dirname -- "$entry")"
+: >"$WORK/empty/official/.gitkeep"
+cp -- "$entry" "$WORK/one/$entry"
+fields="$(xtask index check-entry --entries "$WORK/one" --existing "$WORK/empty" \
+  --core-version "$core_version" --stage schema 2>&1)" || die "schema stage refused $entry: $fields"
+package_id="" version="" digest="" url=""
+while IFS='=' read -r key value; do
+  case "$key" in
+    package_id) package_id="$value" ;;
+    version) version="$value" ;;
+    digest) digest="$value" ;;
+    url) url="$value" ;;
+  esac
+done <<<"$fields"
+[ -n "$package_id" ] && [ -n "$version" ] && [ -n "$digest" ] && [ -n "$url" ] || die "the entry fields are incomplete"
+
+archive="$WORK/$package_id-$version.tar.zst"
+curl --proto '=https' --tlsv1.2 --max-redirs 5 --fail --silent --show-error --location \
+  --max-filesize "$MAX_ARCHIVE_BYTES" "$url" |
+  head -c "$((MAX_ARCHIVE_BYTES + 1))" >"$archive" || true
+size="$(wc -c <"$archive")"
+{ [ "$size" -gt 0 ] && [ "$size" -le "$MAX_ARCHIVE_BYTES" ]; } || die "archive download failed or exceeded the cap"
+[ "sha256:$(sha256 "$archive")" = "$digest" ] || die "archive sha256 differs from the entry digest"
+
+daemon="pohunek-daemon-$core_version-$platform.tar.gz"
+core_sha="$(gh api "repos/$CORE_REPO/commits/refs/tags/$LATEST" --jq .sha)" ||
+  die "refs/tags/$LATEST does not resolve in $CORE_REPO"
+mkdir -p "$WORK/release"
+gh release download "$LATEST" --repo "$CORE_REPO" --pattern "$daemon" --dir "$WORK/release" ||
+  die "$daemon cannot be downloaded from the $LATEST release"
+gh attestation verify "$WORK/release/$daemon" --repo "$CORE_REPO" \
+  --signer-workflow "$CORE_EVIDENCE_WORKFLOW" \
+  --signer-digest "$core_sha" \
+  --source-ref "refs/tags/$LATEST" \
+  --source-digest "$core_sha" \
+  --deny-self-hosted-runners || die "the core daemon archive is not attested"
+tar -xzf "$WORK/release/$daemon" -C "$WORK/release" || die "$daemon cannot be extracted"
+
+xtask plugin prove --archive "$archive" --entry "$WORK/one/$entry" \
+  --release-dir "$WORK/release/pohunek-daemon-$core_version-$platform" \
+  --evidence "$WORK/evidence-$platform.json"
