@@ -334,7 +334,7 @@ jobs:
           S="$SEQUENCE"
           # `gh release list` fetches 30 items by default; page through all of them.
           gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | select(.tag_name | startswith("index-")) | select(.tag_name != "index-'"$S"'") | "\(.tag_name) \(.created_at) \(.is_draft)"' |
+            --jq '.[] | select(.tag_name | startswith("index-")) | select(.tag_name != "index-'"$S"'") | "\(.tag_name) \(.created_at) \(.draft)"' |
           while IFS=' ' read -r tag created is_draft; do
             age_days="$(( ($(date -u +%s) - $(date -u -d "$created" +%s)) / 86400 ))"
             if [ "$is_draft" = "true" ] || [ "$age_days" -gt 30 ]; then
