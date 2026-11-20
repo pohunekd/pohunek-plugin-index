@@ -79,7 +79,7 @@ jobs:
           fi
           test "$failed" = 0
           entries="$(printf '%s\n' "${added[@]}" | jq -R . | jq -sc 'map(select(length > 0))')"
-          matrix="$(jq -c '[.[] as $e | ({platform: "x86_64-unknown-linux-gnu", runner: "ubuntu-24.04"}, {platform: "aarch64-apple-darwin", runner: "macos-14"}) + {entry: $e}]' <<<"$entries")"
+          matrix="$(jq -c '[.[] as $e | ({platform: "x86_64-unknown-linux-gnu", runner: "ubuntu-24.04"}, {platform: "aarch64-apple-darwin", runner: "macos-15"}) + {entry: $e}]' <<<"$entries")"
           {
             printf 'entries=%s\n' "$entries"
             printf 'matrix=%s\n' "$matrix"
