@@ -1,0 +1,14 @@
+package_id = "pohunek.runtime.muse"
+runtime_id = "muse"
+version = "0.1.0"
+digest = "sha256:c7d8954a20bd1f4c3e1d3adc701cc76012caffc125fef09f6ec749263199a4f1"
+url = "https://github.com/pohunekd/plugin-muse-code/releases/download/v0.1.0/pohunek.runtime.muse-0.1.0.tar.zst"
+platforms = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+core = ">=0.40.0"
+
+[source]
+repo = "pohunekd/plugin-muse-code"
+repo_id = 1434893836
+tag = "v0.1.0"
+commit = "df5169d20a98dba5aa8556ed81c3a977643048fe"
+built_with = "v0.43.1"
