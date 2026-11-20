@@ -38,7 +38,7 @@ Changes to `scripts/` and `.github/` run from the pull request itself, so a
 reviewer reads them before approving.
 
 Required repository settings (ruleset on `main`): the `admission / verdict`
-check, a pull request with a CODEOWNERS review, stale approvals dismissed,
-approval of the most recent push, and branches up to date before merging. The
-check is only as strong as that review, because a pull request runs its own
-copy of the workflow and of `scripts/admit`.
+check and a pull request with no required approvals. The owner's review of the
+pull request is the merge decision; nothing else gates the merge. The check is
+only as strong as that review, because a pull request runs its own copy of the
+workflow and of `scripts/admit`.
