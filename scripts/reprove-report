@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Turns the proof evidence of one re-proof run into an issue body and a decision.
+#
+#   scripts/reprove-report <evidence-dir> <matrix-file>
+#
+# <evidence-dir> holds the `evidence-*.json` files the prove jobs uploaded (any
+# depth). <matrix-file> is the plan's matrix: a JSON array of `{entry, platform}`
+# rows, the rows that were supposed to produce evidence. The script reads only
+# those JSON files and executes nothing from them. Evidence fields are matched
+# to the expected rows and validated before they reach the body.
+#
+# Environment: LATEST (core release tag, vX.Y.Z), RUN_URL (optional run link).
+#
+# Output: the issue body, then one last line, `decision=close` when every
+# expected row passed or `decision=keep-open` otherwise. A row with no evidence,
+# unreadable or duplicated evidence, or a failed proof is not a pass.
+set -Eeuo pipefail
+
+dir="${1:?evidence directory required}"
+matrix_file="${2:?matrix file required}"
+: "${LATEST:?LATEST is required}"
+[[ "$LATEST" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf 'reprove-report: LATEST is not vX.Y.Z\n' >&2; exit 1; }
+[ -d "$dir" ] || { printf 'reprove-report: %s is not a directory\n' "$dir" >&2; exit 1; }
+
+# Every evidence file that parses as one JSON object is collected; a file that
+# does not parse is counted and never matches a row.
+evidence_all='[]'
+unreadable=0
+while IFS= read -r file; do
+  if document="$(jq -c 'if type == "object" then . else error("not an object") end' "$file" 2>/dev/null)"; then
+    evidence_all="$(jq -c --argjson doc "$document" '. + [$doc]' <<<"$evidence_all")"
+  else
+    unreadable=$((unreadable + 1))
+  fi
+done < <(find "$dir" -type f -name 'evidence-*.json' | LC_ALL=C sort)
+
+# One result per expected row. Only a result that is exactly `pass` with a null
+# failed_step counts as a pass; the failed_step is shown only when it is a short
+# lowercase word, so evidence content never injects markup into the table.
+rows="$(jq -c --argjson evidence "$evidence_all" '
+  def step_ok: type == "string" and test("^[a-z0-9_-]{1,40}$");
+  map(
+    . as $row
+    | ($row.entry | capture("^official/(?<pkg>[^/]+)/(?<ver>[^/]+)\\.toml$")) as $id
+    | [$evidence[] | select(.package_id == $id.pkg and .version == $id.ver and .platform == $row.platform)] as $found
+    | {entry: $row.entry, platform: $row.platform} + (
+        if ($found | length) == 0 then {result: "no-evidence", failed_step: "-"}
+        elif ($found | length) > 1 then {result: "duplicate-evidence", failed_step: "-"}
+        else
+          $found[0] as $e
+          | if $e.schema == 1 and $e.result == "pass" and $e.failed_step == null then {result: "pass", failed_step: "-"}
+            elif $e.schema == 1 and $e.result == "fail" then {result: "fail", failed_step: (if ($e.failed_step | step_ok) then $e.failed_step else "unreadable" end)}
+            else {result: "invalid-evidence", failed_step: "-"}
+            end
+        end))
+' "$matrix_file")"
+
+total="$(jq 'length' <<<"$rows")"
+passed="$(jq '[.[] | select(.result == "pass")] | length' <<<"$rows")"
+
+printf 'Re-proof of the admitted entries against core `%s`: %s of %s rows passed.\n\n' "$LATEST" "$passed" "$total"
+printf '| Entry | Platform | Result | Failed step |\n|---|---|---|---|\n'
+jq -r '.[] | "| `\(.entry)` | `\(.platform)` | \(.result) | \(.failed_step) |"' <<<"$rows"
+if [ "$unreadable" -gt 0 ]; then
+  printf '\n%s evidence file(s) could not be read.\n' "$unreadable"
+fi
+if [ -n "${RUN_URL:-}" ]; then
+  printf '\nRun: %s\n' "$RUN_URL"
+fi
+
+if [ "$total" -gt 0 ] && [ "$passed" -eq "$total" ]; then
+  printf 'decision=close\n'
+else
+  printf 'decision=keep-open\n'
+fi

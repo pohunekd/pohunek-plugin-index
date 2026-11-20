@@ -8,7 +8,8 @@
 # empty work directory. Everything else is read from files: the core checkout
 # (for `CORE_TAG`, the key record and the revocations at the repository root,
 # and the anchor and channel from the core checkout's `packaging/`), and a
-# `GH_TOKEN` in the environment for the read-only API checks.
+# `GH_TOKEN` and `GITHUB_REPOSITORY` in the environment for the read-only API
+# checks and the previous-sequence lookup.
 #
 # The recheck runs #1938 D1 step 3 over every entry (repo control, archive
 # digest, attestation of the plugin release; API-only, no plugin code runs).
@@ -122,8 +123,12 @@ check_one() {
   # Step 3: the release asset at the tag still hashes to the digest, and the
   # core release workflow attested it.
   local entry_lines=""
+  local schema_refusal=""
   entry_lines="$(xtask index check-entry --entries "$single" --existing "$work_dir/empty" \
-    --core-version "$core_version" --stage schema 2>/dev/null)" || entry_lines=""
+    --core-version "$core_version" --stage schema 2>"$work_dir/check-entry.err")" || {
+    entry_lines=""
+    schema_refusal="$(head -c 300 "$work_dir/check-entry.err")"
+  }
   local package_id="" version="" digest="" url="" key2="" value2=""
   while IFS='=' read -r key2 value2; do
     case "$key2" in
@@ -134,7 +139,7 @@ check_one() {
     esac
   done <<<"$entry_lines"
   [ -n "$package_id" ] && [ -n "$version" ] && [ -n "$digest" ] && [ -n "$url" ] || {
-    printf 'sign-build: %s: schema refused the entry\n' "$rel" >&2
+    printf 'sign-build: %s: schema refused the entry: %s\n' "$rel" "$schema_refusal" >&2
     return 1
   }
   [ "$url" = "https://github.com/$source_repo/releases/download/$source_tag/$package_id-$version.tar.zst" ] || {
@@ -196,14 +201,14 @@ check_all "$full"
 # lower sequence. A missing release means none exists yet; any other gh
 # failure or an unexpected latest tag stops the run.
 previous=0
-if latest_tag="$(gh api "repos/pohunekd/pohunek-plugin-index/releases/latest" \
+if latest_tag="$(gh api "repos/${GITHUB_REPOSITORY:?}/releases/latest" \
   --jq .tag_name 2>"$work_dir/latest.err")"; then
   [[ "$latest_tag" =~ ^index-([0-9]+)$ ]] || {
     printf 'sign-build: latest release %s is not index-N\n' "$latest_tag" >&2
     exit 1
   }
   previous="${BASH_REMATCH[1]}"
-elif grep -q "HTTP 404" "$work_dir/latest.err" 2>/dev/null || grep -q '"status":"404"' "$work_dir/latest.err" 2>/dev/null; then
+elif grep -q "HTTP 404" "$work_dir/latest.err" 2>/dev/null; then
   previous=0
 else
   printf 'sign-build: latest release lookup failed: %s\n' \

@@ -1,0 +1,208 @@
+# Re-proves every admitted entry against the newest core release and records
+# the result as an issue titled `reprove <tag>`. Admission proves an entry
+# against CORE_TAG only, so this run covers the later cores that an open-ended
+# `core` range admits.
+#
+# The issue authored by this workflow is the record that a core was re-proved:
+# a tag with such an issue (open or closed) is never planned again. An issue
+# with that title by anyone else is ignored.
+#
+# No job here reads a secret or an environment. `prove` runs with `contents:
+# read`. `report` reads only the evidence JSON and calls `gh` on the decision
+# line printed by `scripts/reprove-report`; nothing from the artifacts is
+# executed, and nothing is written to the repository.
+name: reprove
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: reprove
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Assignee of a reprove issue that stays open.
+  REPROVE_ASSIGNEE: zajca
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      latest: ${{ steps.latest.outputs.latest }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Resolve the latest core release and skip a recorded one
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest="$(gh release list --repo zajca/pohunek --exclude-drafts --exclude-pre-releases \
+            --limit 100 --json tagName --jq '.[].tagName' |
+            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+          [[ "$latest" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "no core release found" >&2; exit 1; }
+          recorded="$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --author app/github-actions \
+            --search "\"reprove $latest\" in:title" --json title \
+            --jq "[.[] | select(.title == \"reprove $latest\")] | length")"
+          printf 'latest=%s\n' "$latest" >>"$GITHUB_OUTPUT"
+          if [ "$recorded" != "0" ]; then
+            printf 'skip=true\n' >>"$GITHUB_OUTPUT"
+            printf '%s was already re-proved\n' "$latest"
+          else
+            printf 'skip=false\n' >>"$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: steps.latest.outputs.skip == 'false'
+        with:
+          repository: zajca/pohunek
+          ref: refs/tags/${{ steps.latest.outputs.latest }}
+          path: core
+          persist-credentials: false
+      - name: Build xtask at the latest core
+        if: steps.latest.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' core/rust-toolchain.toml)" --profile minimal
+          (cd core && cargo build --locked -p xtask)
+      - name: Plan the rows
+        id: plan
+        env:
+          LATEST: ${{ steps.latest.outputs.latest }}
+          SKIP: ${{ steps.latest.outputs.skip }}
+        run: |
+          set -euo pipefail
+          if [ "$SKIP" = "true" ]; then
+            printf 'matrix=[]\n' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          export CORE_DIR="$PWD/core" WORK="$RUNNER_TEMP/plan"
+          mkdir -p "$WORK"
+          scripts/reprove-plan | tee "$WORK/plan.txt"
+          grep '^matrix=' "$WORK/plan.txt" >>"$GITHUB_OUTPUT"
+
+  prove:
+    name: prove
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: zajca/pohunek
+          ref: refs/tags/${{ needs.plan.outputs.latest }}
+          path: core
+          persist-credentials: false
+      - name: Build xtask at the latest core
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' core/rust-toolchain.toml)" --profile minimal
+          (cd core && cargo build --locked -p xtask)
+      - name: Prove the entry on the platform
+        env:
+          ENTRY: ${{ matrix.entry }}
+          PLATFORM: ${{ matrix.platform }}
+          LATEST: ${{ needs.plan.outputs.latest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export CORE_DIR="$PWD/core" WORK="$RUNNER_TEMP/reprove"
+          mkdir -p "$WORK"
+          scripts/reprove-prove "$ENTRY" "$PLATFORM"
+      - name: Name the evidence file
+        if: always()
+        id: evidence
+        env:
+          ENTRY: ${{ matrix.entry }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          name="${ENTRY//\//_}-$PLATFORM"
+          printf 'name=%s\n' "$name" >>"$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: reprove-evidence-${{ steps.evidence.outputs.name }}
+          path: ${{ runner.temp }}/reprove/evidence-*.json
+          if-no-files-found: ignore
+
+  report:
+    name: report
+    needs: [plan, prove]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.matrix != '[]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          pattern: reprove-evidence-*
+          path: evidence
+      - name: Open the issue and close it on full success
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ needs.plan.outputs.latest }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          printf '%s' "$MATRIX" >"$RUNNER_TEMP/matrix.json"
+          out="$(scripts/reprove-report evidence "$RUNNER_TEMP/matrix.json")"
+          decision="$(printf '%s\n' "$out" | tail -n 1)"
+          printf '%s\n' "$out" | sed '$d' >"$RUNNER_TEMP/body.md"
+          title="reprove $LATEST"
+          case "$decision" in
+            decision=close | decision=keep-open) ;;
+            *) echo "unexpected decision line: $decision" >&2; exit 1 ;;
+          esac
+          # A re-run of failed jobs reuses the plan, so the issue of this tag may
+          # already exist: only the exact title by this workflow counts, and the
+          # new result is commented on it instead of opening a second issue.
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --author app/github-actions \
+            --search "\"$title\" in:title" --json number,title \
+            --jq "[.[] | select(.title == \"$title\")] | .[0].number // empty")"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/body.md"
+            if [ "$decision" = "decision=close" ]; then
+              gh issue close "$number" --repo "$GITHUB_REPOSITORY"
+            else
+              gh issue reopen "$number" --repo "$GITHUB_REPOSITORY"
+              gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --add-assignee "$REPROVE_ASSIGNEE"
+            fi
+          elif [ "$decision" = "decision=close" ]; then
+            url="$(gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$RUNNER_TEMP/body.md")"
+            gh issue close "$url" --repo "$GITHUB_REPOSITORY"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$RUNNER_TEMP/body.md" \
+              --assignee "$REPROVE_ASSIGNEE"
+          fi

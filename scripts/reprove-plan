@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Plans the re-proof of every admitted entry against one core release.
+#
+#   scripts/reprove-plan
+#
+# Inputs arrive through the environment (set by reprove.yml):
+#   CORE_DIR   absolute path of the zajca/pohunek checkout at LATEST, with xtask
+#              built in it; xtask runs only inside a checkout
+#   LATEST     the core release tag, vX.Y.Z
+#   WORK       empty scratch directory
+#
+# The admitted tree is read-only here. Every entry is checked against an empty
+# existing tree: an admitted entry is its own duplicate, so the schema stage
+# cannot run against the admitted tree. The core-range stage refuses with the
+# predicate `core-excludes-core-tag` when the range does not admit LATEST; that
+# one refusal means "not in range" and every other refusal fails the plan.
+#
+# Prints `entries=<json array>` and `matrix=<json array>` for the workflow. A
+# matrix row is `{entry, platform, runner}`: one row per entry and platform.
+set -Eeuo pipefail
+
+: "${CORE_DIR:?CORE_DIR is required}"
+: "${LATEST:?LATEST is required}"
+: "${WORK:?WORK is required}"
+
+readonly RUNNER_LINUX="ubuntu-24.04"
+readonly RUNNER_MACOS="macos-15"
+
+[[ "$LATEST" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { printf 'reprove-plan: LATEST is not vX.Y.Z\n' >&2; exit 1; }
+core_version="${LATEST#v}"
+
+xtask() { (cd "$CORE_DIR" && ./target/debug/xtask "$@"); }
+
+runner_of() {
+  case "$1" in
+    x86_64-unknown-linux-gnu) printf '%s' "$RUNNER_LINUX" ;;
+    aarch64-apple-darwin) printf '%s' "$RUNNER_MACOS" ;;
+    *) return 1 ;;
+  esac
+}
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+rm -rf -- "$WORK/one" "$WORK/empty"
+mkdir -p "$WORK/empty/official"
+: >"$WORK/empty/official/.gitkeep"
+
+entries='[]'
+matrix='[]'
+while IFS= read -r entry; do
+  [[ "$entry" =~ ^official/[A-Za-z0-9._-]+/[0-9]+\.[0-9]+\.[0-9]+\.toml$ ]] || {
+    printf 'reprove-plan: not an entry path: %s\n' "$entry" >&2
+    exit 1
+  }
+  rm -rf -- "$WORK/one"
+  mkdir -p -- "$WORK/one/$(dirname -- "$entry")"
+  cp -- "$entry" "$WORK/one/$entry"
+
+  fields="$(xtask index check-entry --entries "$WORK/one" --existing "$WORK/empty" \
+    --core-version "$core_version" --stage schema 2>&1)" || {
+    printf 'reprove-plan: %s: schema stage refused: %s\n' "$entry" "$fields" >&2
+    exit 1
+  }
+  if range="$(xtask index check-entry --entries "$WORK/one" --existing "$WORK/empty" \
+    --core-version "$core_version" --stage core-range 2>&1)"; then
+    :
+  else
+    case "$range" in
+      *"predicate=core-excludes-core-tag"*) continue ;;
+      *) printf 'reprove-plan: %s: core-range stage refused: %s\n' "$entry" "$range" >&2; exit 1 ;;
+    esac
+  fi
+
+  platforms=""
+  while IFS='=' read -r key value; do
+    [ "$key" = platforms ] && platforms="$value"
+  done <<<"$fields"
+  [ -n "$platforms" ] || { printf 'reprove-plan: %s: no platforms\n' "$entry" >&2; exit 1; }
+
+  entries="$(jq -c --arg entry "$entry" '. + [$entry]' <<<"$entries")"
+  IFS=',' read -r -a listed <<<"$platforms"
+  for platform in "${listed[@]}"; do
+    runner="$(runner_of "$platform")" || {
+      printf 'reprove-plan: %s: platform %s cannot be proven\n' "$entry" "$platform" >&2
+      exit 1
+    }
+    matrix="$(jq -c --arg entry "$entry" --arg platform "$platform" --arg runner "$runner" \
+      '. + [{entry: $entry, platform: $platform, runner: $runner}]' <<<"$matrix")"
+  done
+done < <(find official -mindepth 2 -maxdepth 2 -name '*.toml' | LC_ALL=C sort)
+
+printf 'entries=%s\n' "$entries"
+printf 'matrix=%s\n' "$matrix"

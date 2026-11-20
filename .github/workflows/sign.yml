@@ -204,20 +204,27 @@ jobs:
           # xtask refuses to run outside a pohunek checkout, so it runs from core/ and
           # every file argument is an absolute path into the input directory.
           xtask() { (cd ../core && ./target/debug/xtask "$@"); }
+          # The trust anchor and the channel come from this job's own core checkout.
+          # The copies in the build artifact must be identical to them.
+          core_packaging="$(cd ../core/packaging && pwd)"
+          anchor="$core_packaging/runtime-catalog-anchor.json"
+          channel="$core_packaging/plugin-index-channel.json"
+          cmp "$in_dir/runtime-catalog-anchor.json" "$anchor"
+          cmp "$in_dir/plugin-index-channel.json" "$channel"
           key_id="$(jq -r .key_id official.record.json)"
           printf '%s\n' "$SIGNATURE_V1" > signature-v1.hex
           printf '%s\n' "$SIGNATURE_V2" > signature-v2.hex
           xtask index attach --unsigned "$in_dir/unsigned-v1.json" \
             --key-id "$key_id" --signature "$in_dir/signature-v1.hex" \
-            --anchor "$in_dir/runtime-catalog-anchor.json" --channel "$in_dir/plugin-index-channel.json" \
+            --anchor "$anchor" --channel "$channel" \
             --output "$in_dir/signed/official-index-v1.json"
           xtask index attach --unsigned "$in_dir/unsigned-v2.json" \
             --key-id "$key_id" --signature "$in_dir/signature-v2.hex" \
-            --anchor "$in_dir/runtime-catalog-anchor.json" --channel "$in_dir/plugin-index-channel.json" \
+            --anchor "$anchor" --channel "$channel" \
             --output "$in_dir/signed/official-index-v2.json"
           for version in 1 2; do
             xtask index verify --index "$in_dir/signed/official-index-v$version.json" \
-              --anchor "$in_dir/runtime-catalog-anchor.json" --channel "$in_dir/plugin-index-channel.json" \
+              --anchor "$anchor" --channel "$channel" \
               --index-high-water "$SEQUENCE"
           done
           printf 'document_v1_digest=%s\n' "$(sha256sum signed/official-index-v1.json | cut -d' ' -f1)" >>"$GITHUB_OUTPUT"
@@ -264,16 +271,6 @@ jobs:
           gh release upload "index-$S" --repo "$GITHUB_REPOSITORY" out/official-index-v1.json out/official-index-v2.json out/SHA256SUMS
           gh release edit "index-$S" --repo "$GITHUB_REPOSITORY" --draft=false --latest
           printf '%s\n' "$S" > sequence
-          # Stale drafts and old releases never pile up: tags are never reused.
-          # `gh release list` fetches 30 items by default; page through all of them.
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | select(.tag_name | startswith("index-")) | select(.tag_name != "index-'"$S"'") | "\(.tag_name) \(.created_at) \(.is_draft)"' |
-          while IFS=' ' read -r tag created is_draft; do
-            age_days="$(( ($(date -u +%s) - $(date -u -d "$created" +%s)) / 86400 ))"
-            if [ "$is_draft" = "true" ] || [ "$age_days" -gt 30 ]; then
-              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
-            fi
-          done
 
   verify-live:
     name: verify-live
@@ -301,15 +298,48 @@ jobs:
         run: |
           set -euo pipefail
           S="$SEQUENCE"
+          # The trust anchor and the channel come from this job's own core
+          # checkout. The copies in the build artifact must be identical to them.
+          cmp in/runtime-catalog-anchor.json core/packaging/runtime-catalog-anchor.json
+          cmp in/plugin-index-channel.json core/packaging/plugin-index-channel.json
           rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' core/rust-toolchain.toml)" --profile minimal
           (cd core && cargo build --locked -p xtask)
           for version in 1 2; do
             curl -fsSL --max-filesize 1048576 -o "latest-v$version.json" \
               "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/official-index-v$version.json"
             (cd core && ./target/debug/xtask index verify --index "../latest-v$version.json" \
-              --anchor ../in/runtime-catalog-anchor.json --channel ../in/plugin-index-channel.json \
+              --anchor packaging/runtime-catalog-anchor.json --channel packaging/plugin-index-channel.json \
               --index-high-water "$S" | tee "../verify-v$version.txt")
             grep -q "sequence=$S " "verify-v$version.txt"
+          done
+
+  cleanup:
+    name: cleanup
+    needs: [build, publish, verify-live]
+    if: always() && needs.publish.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      # Stale drafts and old releases never pile up: tags are never reused. This
+      # runs after the live release has been verified and nothing depends on it,
+      # so a failed delete cannot hide the verification of the published index.
+      - name: Delete drafts and releases older than 30 days
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEQUENCE: ${{ needs.build.outputs.sequence }}
+        run: |
+          set -euo pipefail
+          S="$SEQUENCE"
+          # `gh release list` fetches 30 items by default; page through all of them.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.tag_name | startswith("index-")) | select(.tag_name != "index-'"$S"'") | "\(.tag_name) \(.created_at) \(.draft)"' |
+          while IFS=' ' read -r tag created is_draft; do
+            age_days="$(( ($(date -u +%s) - $(date -u -d "$created" +%s)) / 86400 ))"
+            if [ "$is_draft" = "true" ] || [ "$age_days" -gt 30 ]; then
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+            fi
           done
 
   liveness:
@@ -333,7 +363,16 @@ jobs:
           set -euo pipefail
           if [ "$(git log -1 --format=%ct)" -lt "$(($(date -u +%s) - 45 * 86400))" ]; then
             gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/sign.yml/enable"
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/reprove.yml/enable"
           fi
+          # A seconds value is a plain decimal integer of at most 12 digits: it
+          # then fits shell arithmetic and cannot be read as octal.
+          is_seconds() {
+            case "$1" in
+              '' | *[!0-9]*) return 1 ;;
+            esac
+            [ "${#1}" -le 12 ]
+          }
           reasons=""
           if [ "${INDEX_PUBLISH_ENABLED:-}" = "true" ]; then
             doc="$(curl -fsSL --max-filesize 1048576 \
@@ -341,36 +380,40 @@ jobs:
               reasons="the latest published v2 document cannot be fetched"
             }
             if [ -z "$reasons" ]; then
-              expires_at="$(printf '%s' "$doc" | jq -r .index.expires_at)"
-              now="$(date -u +%s)"
-              if [ "$((expires_at - now))" -lt "$((3 * 86400))" ]; then
-                reasons="the published index expires at $expires_at, less than 3 days away"
+              expires_at="$(printf '%s' "$doc" | jq -r '.index.expires_at // empty' 2>/dev/null || true)"
+              if is_seconds "$expires_at"; then
+                now="$(date -u +%s)"
+                if [ "$((10#$expires_at - now))" -lt "$((3 * 86400))" ]; then
+                  reasons="the published index expires at $expires_at, less than 3 days away"
+                fi
+              else
+                reasons="the published index has no readable expires_at"
               fi
             fi
-            if [ -n "${reasons:-}" ] || [ -f keys/official.record.json ]; then
-              not_after="$(jq -r .not_after keys/official.record.json 2>/dev/null || true)"
-              now="$(date -u +%s)"
-              case "$not_after" in
-                '' | null) ;;
-                *)
-                  if [ "$((not_after - now))" -lt "$((30 * 86400))" ]; then
-                    reasons="${reasons:+$reasons; }the key record expires at $not_after, less than 30 days away"
-                  fi
-                  ;;
-              esac
+            if [ -f keys/official.record.json ]; then
+              not_after="$(jq -r '.not_after // empty' keys/official.record.json 2>/dev/null || true)"
+              if is_seconds "$not_after"; then
+                now="$(date -u +%s)"
+                if [ "$((10#$not_after - now))" -lt "$((30 * 86400))" ]; then
+                  reasons="${reasons:+$reasons; }the key record expires at $not_after, less than 30 days away"
+                fi
+              else
+                reasons="${reasons:+$reasons; }the key record has no readable not_after"
+              fi
             fi
           fi
+          # Only an issue this workflow authored with exactly this title counts:
+          # anyone can open a public issue with a similar title.
           title="index liveness"
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --author app/github-actions \
+            --search "\"$title\" in:title" --json number,title \
+            --jq "[.[] | select(.title == \"$title\")] | .[0].number // empty")"
           if [ -n "$reasons" ]; then
-            number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$title in:title" \
-              --json number --jq '.[0].number // empty')"
             if [ -z "$number" ]; then
               gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$reasons"
             else
               gh issue comment --repo "$GITHUB_REPOSITORY" "$number" --body "$reasons"
             fi
           else
-            number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "index liveness in:title" \
-              --json number --jq '.[0].number // empty')"
             [ -z "$number" ] || gh issue close --repo "$GITHUB_REPOSITORY" "$number"
           fi

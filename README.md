@@ -17,6 +17,13 @@ The list of plugins that install by id with `pohunek plugin install <id>`.
   Publishing stays off until the owner sets the repository variable
   `INDEX_PUBLISH_ENABLED` to `true` (after the key ceremony). Until then
   the schedule and pushes stay green and publish nothing.
+- `.github/workflows/reprove.yml` re-proves every admitted entry against each new
+  core release (`scripts/reprove-plan`, `scripts/reprove-prove`,
+  `scripts/reprove-report`). The run opens the issue `reprove <tag>`, closes it
+  when every entry passes on every platform, and leaves it open and assigned
+  otherwise. That issue, authored by the workflow, is the record that a core
+  release was re-proved. The workflow reads no secret and writes nothing to the
+  repository.
 - `keys/official.record.json` and `revocations/revocations.json` hold the
   public key material of the index signing key; they change only through a
   reviewed pull request that the `material` job verifies.
