@@ -1,0 +1,8 @@
+schema = 1
+id = "pohunek.runtime.fixture"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+detect_manifest = "detect.toml"
+program = "fixture"

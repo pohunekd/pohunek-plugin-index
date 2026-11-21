@@ -1,0 +1,10 @@
+schema = 1
+id = "pohunek.context.fixture"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+detect_manifest = "detect.toml"
+
+[context]
+dir = "bundle"
