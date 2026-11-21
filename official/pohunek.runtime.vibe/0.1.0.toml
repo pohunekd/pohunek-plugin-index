@@ -1,0 +1,14 @@
+package_id = "pohunek.runtime.vibe"
+runtime_id = "vibe"
+version = "0.1.0"
+digest = "sha256:22a60e3829819568560dfe718e0ac3730035408805fefd5de72cc34e766d5a61"
+url = "https://github.com/pohunekd/plugin-mistral-vibe/releases/download/v0.1.0/pohunek.runtime.vibe-0.1.0.tar.zst"
+platforms = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+core = ">=0.44.0"
+
+[source]
+repo = "pohunekd/plugin-mistral-vibe"
+repo_id = 1465187263
+tag = "v0.1.0"
+commit = "106bb03a5bd95adc4ac44ffa1e884c5eaaa0a92c"
+built_with = "v0.44.0"
