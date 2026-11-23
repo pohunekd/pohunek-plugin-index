@@ -35,6 +35,13 @@ no `runtime_id`; the v1 document then omits it while the v2 document lists it.
 The format and the admission steps are described
 in the Pohunek guide "Plugin repositories".
 
+The reviewer view of admission depends on the entry kind. A runtime entry
+requires the archive's `runtime.toml` to have `[runtime]` (with
+`detect_manifest`) and no `[context]`, and shows `runtime.toml` and
+`detect.toml`. A context entry requires `[context]` and no `[runtime]`, and
+shows `runtime.toml` alone. Any other combination fails admission.
+`tests/admit-reviewer-view.sh` covers both kinds and the mismatches.
+
 A package submitted to the official index must live in `package/`: index
 admission rebuilds the archive from the `package` directory and refuses any
 other layout (`scripts/admit`, the "5 package-dir" check).

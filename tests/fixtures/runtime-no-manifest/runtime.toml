@@ -1,0 +1,7 @@
+schema = 1
+id = "pohunek.runtime.fixture"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+program = "fixture"

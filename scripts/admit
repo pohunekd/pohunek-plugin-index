@@ -125,6 +125,7 @@ load_entry() {
     esac
   done <<<"$source_lines"
 
+  runtime_id=""
   while IFS='=' read -r key value; do
     case "$key" in
       package_id) package_id="$value" ;;
@@ -136,6 +137,18 @@ load_entry() {
       *) fail "schema" "unexpected entry key" ;;
     esac
   done <<<"$entry_lines"
+
+  # The entry kind follows the schema-validated file: a context entry names
+  # `kind = "context"` and no runtime_id; a runtime entry has a runtime_id.
+  if grep -qx 'kind = "context"' -- "$entry"; then
+    entry_kind="context"
+  else
+    entry_kind="runtime"
+  fi
+  if { [ "$entry_kind" = "context" ] && [ -n "$runtime_id" ]; } ||
+    { [ "$entry_kind" = "runtime" ] && [ -z "$runtime_id" ]; }; then
+    fail "1 schema" "entry kind '$entry_kind' does not match its runtime_id"
+  fi
 }
 
 check() {
@@ -248,36 +261,53 @@ rebuild() {
     fail "5 rebuild" "rebuilt $built_id $built_version $built_digest differs from the entry"
 }
 
-# Extracts runtime.toml and the detection manifest it names into `$2` from the
-# archive `$1`. Reads [runtime] detect_manifest, the same table path the daemon
-# parses (crates/daemon/src/agent/host/definition.rs:1436, read at :750). The
-# manifest path comes from the archive, so it is limited to a relative path of
-# safe characters. Returns 1 when either file is unavailable.
+# Extracts the reviewer files into `$2` from the archive `$1` for an entry of
+# kind `$3` (`runtime` or `context`). The archive's runtime.toml must carry the
+# table of that kind and not the other one. A runtime package also yields the
+# detection manifest named by [runtime] detect_manifest, the same table path the
+# daemon parses (crates/daemon/src/agent/host/definition.rs:1436, read at :750);
+# a context package has no detection manifest. The manifest path comes from the
+# archive, so it is limited to a relative path of safe characters. Returns 1 when
+# a file is unavailable or the archive does not match the kind.
 unpack_views() {
-  local archive_file="$1" dir="$2" manifest rc
+  local archive_file="$1" dir="$2" kind="$3" manifest rc=0
   mkdir -p "$dir"
   zstd -dc -- "$archive_file" | tar -x -C "$dir" runtime.toml || return 1
-  command -v python3 >/dev/null 2>&1 || fail "reviewer view" "python3 is required to read [runtime] detect_manifest"
-  manifest="$(python3 -I - "$dir/runtime.toml" <<'PYEOF'
+  command -v python3 >/dev/null 2>&1 || fail "reviewer view" "python3 is required to read runtime.toml"
+  manifest="$(python3 -I - "$dir/runtime.toml" "$kind" <<'PYEOF'
 import sys
 try:
     import tomllib
 except ImportError:
     sys.exit(2)
+kind = sys.argv[2]
 try:
     with open(sys.argv[1], "rb") as handle:
         document = tomllib.load(handle)
-    value = document["runtime"]["detect_manifest"]
-except (OSError, KeyError, TypeError, ValueError):
+except (OSError, ValueError):
     sys.exit(1)
-if not isinstance(value, str):
+has_runtime = "runtime" in document
+has_context = "context" in document
+if kind == "context":
+    if not has_context or has_runtime or not isinstance(document["context"], dict):
+        sys.exit(1)
+elif kind == "runtime":
+    if not has_runtime or has_context:
+        sys.exit(1)
+    try:
+        value = document["runtime"]["detect_manifest"]
+    except (KeyError, TypeError):
+        sys.exit(1)
+    if not isinstance(value, str):
+        sys.exit(1)
+    sys.stdout.write(value)
+else:
     sys.exit(1)
-sys.stdout.write(value)
 PYEOF
-)"
-  rc="$?"
-  [ "$rc" -eq 2 ] && fail "reviewer view" "python3 tomllib is required to read [runtime] detect_manifest"
+)" || rc=$?
+  [ "$rc" -eq 2 ] && fail "reviewer view" "python3 tomllib is required to read runtime.toml"
   [ "$rc" -ne 0 ] && return 1
+  [ "$kind" = "context" ] && return 0
   case "$manifest" in
     "" | -* | /* | *..* | *[!A-Za-z0-9._/-]*) return 1 ;;
   esac
@@ -289,10 +319,12 @@ PYEOF
 reviewer_view() {
   local unpack="$WORK/unpacked" previous prev_dir
   rm -rf -- "$unpack"
-  if ! unpack_views "$archive" "$unpack"; then
-    fail "reviewer view" "runtime.toml or the detection manifest it names cannot be read from the archive"
+  if ! unpack_views "$archive" "$unpack" "$entry_kind"; then
+    fail "reviewer view" "the archive's runtime.toml does not match the $entry_kind entry kind or a file it names cannot be read"
   fi
-  for file in runtime.toml detect.toml; do
+  local files="runtime.toml"
+  [ "$entry_kind" = "runtime" ] && files="runtime.toml detect.toml"
+  for file in $files; do
     emit_file "$file" "$unpack/$file"
   done
 
@@ -306,13 +338,13 @@ reviewer_view() {
     prev_digest="$(sed -n 's/^digest = "\(.*\)"$/\1/p' "$previous")"
     download_capped "$prev_url" "$WORK/previous.tar.zst" &&
       [ "sha256:$(sha256 "$WORK/previous.tar.zst")" = "$prev_digest" ] &&
-      unpack_views "$WORK/previous.tar.zst" "$prev_dir" || {
+      unpack_views "$WORK/previous.tar.zst" "$prev_dir" "$entry_kind" || {
       printf '\nThe previous admitted archive could not be fetched and re-verified.\n' >>"$SUMMARY"
       return 0
     }
     local diff_file="$WORK/views.diff" longest fence
     : >"$diff_file"
-    for file in runtime.toml detect.toml; do
+    for file in $files; do
       diff -u -- "$prev_dir/$file" "$unpack/$file" >>"$diff_file" || true
     done
     longest="$({ grep -o '`*' -- "$diff_file" || true; } | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
@@ -363,9 +395,12 @@ prove() {
   printf '| 6 prove (%s) | pass |\n' "$platform" >>"$SUMMARY"
 }
 
-mode="${1:?usage: admit check <entry> | admit prove <entry> <platform>}"
-case "$mode" in
-  check) check "${2:?entry file required}" ;;
-  prove) prove "${2:?entry file required}" "${3:?platform required}" ;;
-  *) printf 'unknown mode\n' >&2; exit 2 ;;
-esac
+# Sourcing the file (tests/admit-reviewer-view.sh) defines the functions only.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  mode="${1:?usage: admit check <entry> | admit prove <entry> <platform>}"
+  case "$mode" in
+    check) check "${2:?entry file required}" ;;
+    prove) prove "${2:?entry file required}" "${3:?platform required}" ;;
+    *) printf 'unknown mode\n' >&2; exit 2 ;;
+  esac
+fi
