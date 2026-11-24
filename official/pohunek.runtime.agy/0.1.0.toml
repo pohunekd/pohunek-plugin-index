@@ -1,0 +1,14 @@
+package_id = "pohunek.runtime.agy"
+runtime_id = "agy"
+version = "0.1.0"
+digest = "sha256:9330c02eb6079586fb8c6717cb964d585e968e31ab68378f5feba63f3fb19d56"
+url = "https://github.com/pohunekd/plugin-antigravity/releases/download/v0.1.0/pohunek.runtime.agy-0.1.0.tar.zst"
+platforms = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+core = ">=0.44.0"
+
+[source]
+repo = "pohunekd/plugin-antigravity"
+repo_id = 1469938026
+tag = "v0.1.0"
+commit = "74d4e071b6958f7b0eefad87882e7c0aaeba507e"
+built_with = "v0.44.0"
