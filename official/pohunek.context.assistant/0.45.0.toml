@@ -1,0 +1,14 @@
+package_id = "pohunek.context.assistant"
+kind = "context"
+version = "0.45.0"
+digest = "sha256:acf5506c2610590301a898191a817144d518bdd25be92b5d6d4e4e284a95fc8f"
+url = "https://github.com/pohunekd/plugin-assistant/releases/download/v0.45.0/pohunek.context.assistant-0.45.0.tar.zst"
+platforms = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+core = ">=0.45.0, <0.46.0"
+
+[source]
+repo = "pohunekd/plugin-assistant"
+repo_id = 1450662016
+tag = "v0.45.0"
+commit = "387b3ca7155ba595497bc3ba6a939dae28d61762"
+built_with = "v0.45.0"
