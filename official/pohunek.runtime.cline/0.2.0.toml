@@ -1,0 +1,14 @@
+package_id = "pohunek.runtime.cline"
+runtime_id = "cline"
+version = "0.2.0"
+digest = "sha256:8db92baf5c4e98b958dffee90a7b4fae2b45b60659b0c5b0ebfb47cd6981b9d2"
+url = "https://github.com/pohunekd/plugin-cline/releases/download/v0.2.0/pohunek.runtime.cline-0.2.0.tar.zst"
+platforms = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+core = ">=0.45.0"
+
+[source]
+repo = "pohunekd/plugin-cline"
+repo_id = 1447506873
+tag = "v0.2.0"
+commit = "9b3c2b337dd463f976fc5b4f561bf49bb881abc9"
+built_with = "v0.45.0"
